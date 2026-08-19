@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator
+
+import soundfile as sf
+import torch
+from torch.utils.data import Dataset, Sampler
+
+
+LANGUAGE_NAMES = {
+    "zh-CN": "Chinese",
+    "en": "English",
+    "ar": "Arabic",
+    "th": "Thai",
+    "es": "Spanish",
+    "pt-BR": "Portuguese",
+    "pt-PT": "Portuguese",
+}
+
+
+class ManifestDataset(Dataset):
+    def __init__(self, manifest_path: str | Path, dataset_root: str | Path):
+        self.manifest_path = Path(manifest_path)
+        self.dataset_root = Path(dataset_root)
+        with self.manifest_path.open("r", encoding="utf-8") as stream:
+            self.rows = [json.loads(line) for line in stream if line.strip()]
+        if not self.rows:
+            raise ValueError(f"Empty manifest: {self.manifest_path}")
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        row = dict(self.rows[index])
+        audio_path = self.dataset_root / Path(row["audio"])
+        if not audio_path.is_file():
+            raise FileNotFoundError(audio_path)
+        row["audio_path"] = str(audio_path)
+        return row
+
+
+class DurationBucketBatchSampler(Sampler[list[int]]):
+    """Shuffle locally while keeping similarly sized audio in the same batch."""
+
+    def __init__(
+        self,
+        dataset: ManifestDataset,
+        batch_size: int,
+        seed: int,
+        bucket_multiplier: int = 50,
+        drop_last: bool = False,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.seed = seed
+        self.bucket_size = batch_size * bucket_multiplier
+        self.drop_last = drop_last
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        size = len(self.dataset) // self.batch_size
+        if not self.drop_last and len(self.dataset) % self.batch_size:
+            size += 1
+        return size
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.dataset)))
+        rng.shuffle(indices)
+        batches: list[list[int]] = []
+        for start in range(0, len(indices), self.bucket_size):
+            bucket = indices[start : start + self.bucket_size]
+            bucket.sort(key=lambda i: float(self.dataset.rows[i]["duration_s"]))
+            for offset in range(0, len(bucket), self.batch_size):
+                batch = bucket[offset : offset + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+        rng.shuffle(batches)
+        yield from batches
+
+
+@dataclass
+class MTPDataCollator:
+    processor: Any
+    sampling_rate: int = 16000
+    include_eos_in_loss: bool = False
+
+    def _load_audio(self, path: str):
+        audio, sampling_rate = sf.read(path, dtype="float32", always_2d=False)
+        if sampling_rate != self.sampling_rate:
+            raise ValueError(f"Expected {self.sampling_rate} Hz, got {sampling_rate}: {path}")
+        if audio.ndim != 1:
+            raise ValueError(f"Expected mono audio: {path}")
+        return audio
+
+    def __call__(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        audios = [self._load_audio(row["audio_path"]) for row in rows]
+        language_names = []
+        for row in rows:
+            try:
+                language_names.append(LANGUAGE_NAMES[row["language"]])
+            except KeyError as error:
+                raise ValueError(f"Unsupported language code: {row['language']}") from error
+
+        messages = [
+            [
+                {"role": "system", "content": row.get("prompt", "")},
+                {"role": "user", "content": [{"type": "audio", "audio": None}]},
+            ]
+            for row in rows
+        ]
+        generation_prefixes = self.processor.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
+        transcript_prefixes = [
+            prefix + f"language {language}<asr_text>"
+            for prefix, language in zip(generation_prefixes, language_names)
+        ]
+        eos = self.processor.tokenizer.eos_token or ""
+        full_texts = [
+            prefix + row["text"] + eos
+            for prefix, row in zip(transcript_prefixes, rows)
+        ]
+
+        full_inputs = self.processor(
+            text=full_texts,
+            audio=audios,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+        )
+        prefix_inputs = self.processor(
+            text=transcript_prefixes,
+            audio=audios,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+        )
+        prefix_lengths = prefix_inputs["attention_mask"].sum(dim=1).tolist()
+        loss_mask = torch.zeros_like(full_inputs["input_ids"], dtype=torch.bool)
+        full_lengths = full_inputs["attention_mask"].sum(dim=1).tolist()
+        for row_index, (prefix_length, full_length) in enumerate(zip(prefix_lengths, full_lengths)):
+            end = full_length if self.include_eos_in_loss else max(prefix_length, full_length - 1)
+            loss_mask[row_index, prefix_length:end] = True
+
+        full_inputs["loss_mask"] = loss_mask
+        full_inputs["languages"] = [row["language"] for row in rows]
+        full_inputs["sample_ids"] = [row["id"] for row in rows]
+        return full_inputs

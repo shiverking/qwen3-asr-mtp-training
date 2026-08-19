@@ -1,0 +1,56 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, fields
+from pathlib import Path
+
+import yaml
+
+
+@dataclass
+class TrainConfig:
+    model_path: str = "Qwen/Qwen3-ASR-1.7B"
+    dataset_root: str = "/root/autodl-tmp/qwen3_asr_mtp_200h"
+    train_manifest: str = "manifests/train.jsonl"
+    eval_manifest: str = "manifests/dev.jsonl"
+    output_dir: str = "/root/autodl-tmp/outputs/mtp3-stage1"
+    stage: int = 1
+    mtp_depth: int = 3
+    alpha: float = 0.9
+    seed: int = 20260819
+    max_steps: int = 2000
+    batch_size: int = 8
+    gradient_accumulation_steps: int = 4
+    learning_rate: float = 2.0e-4
+    min_learning_rate: float = 1.0e-6
+    warmup_steps: int = 100
+    weight_decay: float = 0.1
+    max_grad_norm: float = 1.0
+    num_workers: int = 4
+    log_steps: int = 10
+    eval_steps: int = 250
+    eval_batches: int = 100
+    save_steps: int = 250
+    save_total_limit: int = 3
+    include_eos_in_loss: bool = False
+    attn_implementation: str = "flash_attention_2"
+    resume_from: str = ""
+    init_mtp_from: str = ""
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> "TrainConfig":
+        with Path(path).open("r", encoding="utf-8") as stream:
+            values = yaml.safe_load(stream) or {}
+        known = {field.name for field in fields(cls)}
+        unknown = set(values) - known
+        if unknown:
+            raise ValueError(f"Unknown config keys: {sorted(unknown)}")
+        config = cls(**values)
+        if config.stage not in (1, 2):
+            raise ValueError("stage must be 1 or 2")
+        if config.stage == 2 and not config.init_mtp_from and not config.resume_from:
+            raise ValueError("Stage 2 requires init_mtp_from or resume_from")
+        return config
+
+    def resolve_manifest(self, value: str) -> str:
+        path = Path(value)
+        return str(path if path.is_absolute() else Path(self.dataset_root) / path)
