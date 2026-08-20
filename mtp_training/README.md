@@ -144,6 +144,90 @@ serial MTP tokens, then verifies them with the backbone. Use it on a small fixed
 sample to check that the faster teacher-forced consistency metric has the same
 trend.
 
+### Round-2 low-acceptance investigation
+
+Metric version 2 separates the loss-training target window from positions that
+can occur in real multi-token decoding. Version-1 fields remain under
+`legacy_*`; existing `branch_accuracy` and `average_accepted_length` aliases
+also retain their old meanings. Use only the `decode_window_*` fields for new
+go/no-go decisions. `macro_average` weights each manifest language equally.
+
+Re-evaluate an existing checkpoint without training it:
+
+```bash
+python -m mtp_training.evaluate_checkpoint \
+  --config configs/mtp3-overfit.yaml \
+  --checkpoint /root/autodl-tmp/outputs/mtp3-overfit/checkpoint-1000 \
+  --output reports/overfit-1000-metrics-v2.json \
+  --gradient-check
+
+python -m mtp_training.audit_dataset \
+  --config configs/mtp3-overfit.yaml \
+  --output-dir reports/overfit-audit \
+  --samples-per-language 100
+
+python -m mtp_training.evaluate_backbone_asr \
+  --config configs/mtp3-overfit.yaml \
+  --languages zh-CN en \
+  --samples-per-language 50 \
+  --output reports/overfit-backbone-asr.json
+
+python -m mtp_training.verify_checkpoint \
+  --config configs/mtp3-overfit.yaml \
+  --checkpoint /root/autodl-tmp/outputs/mtp3-overfit/checkpoint-1000 \
+  --samples 30 \
+  --max-new-tokens 64 \
+  --output reports/overfit-reference-30.json
+```
+
+`reports/overfit-audit/manual_audio_review.jsonl` contains 20 review rows per
+language plus 50 extra Chinese rows. Fill its review fields while listening; it
+is intentionally not consumed by training.
+
+Build fixed single-language and position-A/B manifests:
+
+```bash
+python -m mtp_training.make_round2_manifests \
+  --input /root/autodl-tmp/qwen3_asr_mtp_200h/manifests/diagnostic-overfit.jsonl \
+  --output-dir /root/autodl-tmp/qwen3_asr_mtp_200h/manifests
+```
+
+Run the two 64-row isolation tests from the unmodified backbone:
+
+```bash
+python -m mtp_training.train --config configs/mtp3-overfit-zh64.yaml
+python -m mtp_training.train --config configs/mtp3-overfit-en64.yaml
+```
+
+If MTP-1 is between 50% and 70% at step 400, run exactly one fresh-scheduler
+extension initialized from checkpoint 400:
+
+```bash
+python -m mtp_training.train --config configs/mtp3-overfit-zh64-extend.yaml
+python -m mtp_training.train --config configs/mtp3-overfit-en64-extend.yaml
+```
+
+Do not run an extension below 50%, above 70%, or more than once. After the two
+language tests, rerun the 1,750-row set with naturally mixed batches:
+
+```bash
+python -m mtp_training.train --config configs/mtp3-overfit-mixed.yaml
+```
+
+Position A/B is conditional: run it only if data, mask and causality audits pass
+but either 64-row experiment still fails. First run the base/shifted pair. Run
+the seed-2 pair only when shifted wins by at least 0.05 decode-window accepted
+length in the first pair.
+
+```bash
+python -m mtp_training.train --config configs/mtp3-position-ab-base.yaml
+python -m mtp_training.train --config configs/mtp3-position-ab-shifted.yaml
+
+# Conditional confirmation only:
+python -m mtp_training.train --config configs/mtp3-position-ab-base-seed2.yaml
+python -m mtp_training.train --config configs/mtp3-position-ab-shifted-seed2.yaml
+```
+
 For the first MTP-3 run, continue to Stage 2 only if the Stage-1 dev result is
 stable over two evaluations and global average accepted length is at least
 `3.0 / 4`. A commercial inference claim still requires a real propose/verify

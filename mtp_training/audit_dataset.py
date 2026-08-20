@@ -40,6 +40,15 @@ def _dataset_report(dataset: ManifestDataset, tokenizer, config: TrainConfig) ->
     by_language: dict[str, dict] = defaultdict(
         lambda: {"samples": 0, "duration_s": 0.0, "tokens": [], "suspicious_script": 0}
     )
+    by_language_source: dict[tuple[str, str], dict] = defaultdict(
+        lambda: {
+            "samples": 0,
+            "duration_s": 0.0,
+            "tokens": [],
+            "texts": Counter(),
+            "suspicious_script": 0,
+        }
+    )
     texts = Counter()
     blank = []
     special_text = []
@@ -58,19 +67,42 @@ def _dataset_report(dataset: ManifestDataset, tokenizer, config: TrainConfig) ->
         pattern = SCRIPT_PATTERNS.get(language)
         if pattern and text.strip() and not pattern.search(text):
             item["suspicious_script"] += 1
+        source_item = by_language_source[(language, row.get("source", "unknown"))]
+        source_item["samples"] += 1
+        source_item["duration_s"] += float(row["duration_s"])
+        source_item["tokens"].append(len(token_ids))
+        source_item["texts"][text] += 1
+        if pattern and text.strip() and not pattern.search(text):
+            source_item["suspicious_script"] += 1
         if any(token and token in text for token in tokenizer.all_special_tokens):
             special_text.append(row["id"])
         if len(token_ids) > 4096:
             over_limit.append(row["id"])
     languages = {}
     for language, item in sorted(by_language.items()):
-        tokens = item.pop("tokens")
+        tokens = item["tokens"]
         languages[language] = {
-            **item,
+            **{key: value for key, value in item.items() if key != "tokens"},
             "hours": item["duration_s"] / 3600,
             "transcript_tokens": sum(tokens),
             "mean_tokens": mean(tokens) if tokens else 0.0,
             "token_length": _percentiles(tokens),
+        }
+    language_sources = {}
+    for (language, source), item in sorted(by_language_source.items()):
+        tokens = item["tokens"]
+        language_sources[f"{language}|{source}"] = {
+            "language": language,
+            "source": source,
+            "samples": item["samples"],
+            "hours": item["duration_s"] / 3600,
+            "transcript_tokens": sum(tokens),
+            "mean_tokens": mean(tokens) if tokens else 0.0,
+            "token_length": _percentiles(tokens),
+            "exact_duplicate_text_rows": sum(
+                count - 1 for count in item["texts"].values() if count > 1
+            ),
+            "suspicious_script": item["suspicious_script"],
         }
     duplicate_rows = sum(count - 1 for count in texts.values() if count > 1)
     exposure_samples = (
@@ -88,6 +120,7 @@ def _dataset_report(dataset: ManifestDataset, tokenizer, config: TrainConfig) ->
         "passed": not blank and not over_limit,
         "samples": len(dataset),
         "languages": languages,
+        "language_sources": language_sources,
         "exact_duplicate_text_rows": duplicate_rows,
         "unique_texts": len(texts),
         "blank_text_ids": blank[:100],
@@ -138,6 +171,7 @@ def _alignment_report(dataset, processor, indices, include_eos: bool) -> dict:
             {
                 "id": row["id"],
                 "language": row["language"],
+                "source": row.get("source", "unknown"),
                 "sequence_length": int(active.sum()),
                 "loss_start": loss_positions[0] if loss_positions else None,
                 "loss_end": loss_positions[-1] if loss_positions else None,
@@ -146,6 +180,8 @@ def _alignment_report(dataset, processor, indices, include_eos: bool) -> dict:
                 "contiguous": contiguous,
                 "no_padding_loss": no_padding_loss,
                 "text_tokens_match": text_matches,
+                "first_loss_token_id": selected[0] if selected else None,
+                "expected_first_token_id": expected[0] if expected else None,
             }
         )
     return {
@@ -155,6 +191,34 @@ def _alignment_report(dataset, processor, indices, include_eos: bool) -> dict:
         "failure_ids": failures,
         "samples": samples,
     }
+
+
+def _manual_review_rows(dataset: ManifestDataset, seed: int) -> list[dict]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in dataset.rows:
+        grouped[row["language"]].append(row)
+    rng = random.Random(seed)
+    selected = []
+    for language in sorted(grouped):
+        count = 70 if language == "zh-CN" else 20
+        candidates = rng.sample(grouped[language], min(count, len(grouped[language])))
+        for row in candidates:
+            selected.append(
+                {
+                    "id": row["id"],
+                    "audio": row["audio"],
+                    "text": row["text"],
+                    "language": language,
+                    "source": row.get("source", "unknown"),
+                    "duration_s": row["duration_s"],
+                    "review_language_ok": None,
+                    "review_transcript_ok": None,
+                    "review_truncation": None,
+                    "review_noise": None,
+                    "review_notes": "",
+                }
+            )
+    return selected
 
 
 def main() -> None:
@@ -180,6 +244,11 @@ def main() -> None:
     (output_dir / "alignment_audit.json").write_text(
         json.dumps(alignment_report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    with (output_dir / "manual_audio_review.jsonl").open(
+        "w", encoding="utf-8", newline="\n"
+    ) as stream:
+        for row in _manual_review_rows(dataset, config.seed):
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
     print(
         json.dumps(
             {"dataset": dataset_report["passed"], "alignment": alignment_report["passed"]},
