@@ -81,11 +81,68 @@ config to initialize its MTP branches from a Stage-1 checkpoint. Stage-1
 checkpoints are small; Stage-2 checkpoints include the changed decoder and are
 substantially larger.
 
+## Diagnostics before Stage 2
+
+Do not start Stage 2 when the teacher-forced accepted length is low. Run the
+dataset/alignment audit and checkpoint diagnostics first:
+
+```bash
+python -m mtp_training.audit_dataset \
+  --config configs/mtp3-stage1.yaml \
+  --output-dir reports \
+  --samples-per-language 100
+
+python -m mtp_training.evaluate_checkpoint \
+  --config configs/mtp3-stage1.yaml \
+  --checkpoint /root/autodl-tmp/outputs/mtp3-stage1/checkpoint-2000 \
+  --output reports/checkpoint-2000-diagnostics.json \
+  --gradient-check
+
+python -m mtp_training.verify_checkpoint \
+  --config configs/mtp3-stage1.yaml \
+  --checkpoint /root/autodl-tmp/outputs/mtp3-stage1/checkpoint-2000 \
+  --samples 100 \
+  --output reports/reference-verifier.json
+```
+
+Build the intentional 1,750-sample overfit set and run the diagnostic recipe:
+
+```bash
+python -m mtp_training.make_overfit_manifest \
+  --input /root/autodl-tmp/qwen3_asr_mtp_200h/manifests/train.jsonl \
+  --output /root/autodl-tmp/qwen3_asr_mtp_200h/manifests/diagnostic-overfit.jsonl \
+  --per-language 250
+
+python -m mtp_training.train --config configs/mtp3-overfit.yaml \
+  2>&1 | tee reports/tiny-overfit-metrics.jsonl
+```
+
+`mtp3-overfit.yaml` preserves the original branch position IDs. Run
+`mtp3-overfit-shifted-position.yaml` only as the controlled A/B variant; do not
+change the production position convention unless its alignment checks and
+overfit result are better.
+
+Only after the alignment audit and overfit gate pass, initialize a new
+low-learning-rate Stage-1 phase from checkpoint 2000. This resets the optimizer
+and cosine schedule; do not change `max_steps` and resume the exhausted old
+scheduler.
+
+```bash
+python -m mtp_training.train --config configs/mtp3-stage1-continuation.yaml \
+  2>&1 | tee reports/stage1-continuation-metrics.jsonl
+```
+
 ## Metrics and go/no-go rule
 
-Evaluation reports per-branch top-1 accuracy and strict average accepted length
-globally and for every manifest language/locale layer. Strict acceptance stops
-at the first rejected auxiliary token, matching speculative verification.
+Evaluation reports backbone next-token accuracy, per-branch loss, ground-truth
+accuracy, backbone-consistency accuracy and both strict accepted-length
+variants, globally and per language. The legacy `branch_accuracy` and
+`average_accepted_length` fields remain aliases for ground-truth metrics.
+
+`verify_checkpoint` is deliberately slow: it generates a base token, drafts
+serial MTP tokens, then verifies them with the backbone. Use it on a small fixed
+sample to check that the faster teacher-forced consistency metric has the same
+trend.
 
 For the first MTP-3 run, continue to Stage 2 only if the Stage-1 dev result is
 stable over two evaluations and global average accepted length is at least

@@ -35,6 +35,9 @@ class TrainConfig:
     attn_implementation: str = "flash_attention_2"
     resume_from: str = ""
     init_mtp_from: str = ""
+    sampler_mode: str = "duration"
+    language_temperature: float = 0.5
+    branch_position_mode: str = "base"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TrainConfig":
@@ -49,6 +52,12 @@ class TrainConfig:
             raise ValueError("stage must be 1 or 2")
         if config.stage == 2 and not config.init_mtp_from and not config.resume_from:
             raise ValueError("Stage 2 requires init_mtp_from or resume_from")
+        if config.sampler_mode not in ("duration", "language_temperature"):
+            raise ValueError("sampler_mode must be duration or language_temperature")
+        if not 0.0 <= config.language_temperature <= 1.0:
+            raise ValueError("language_temperature must be between 0 and 1")
+        if config.branch_position_mode not in ("base", "shifted"):
+            raise ValueError("branch_position_mode must be base or shifted")
         return config
 
     def resolve_manifest(self, value: str) -> str:

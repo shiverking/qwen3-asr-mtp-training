@@ -20,5 +20,7 @@ wheels/
 *.egg
 .idea/
 .vscode/
+reports/*.json
+reports/*.jsonl
 venv/
 env/

@@ -188,6 +188,9 @@ def export_checkpoint(
                 "mtp_architecture": MTP_ARCHITECTURE,
                 "mtp_num_hidden_layers": depth,
                 "num_nextn_predict_layers": depth,
+                "mtp_branch_position_mode": train_config.get(
+                    "branch_position_mode", "base"
+                ),
             }
         )
         config_path.write_text(
@@ -207,6 +210,7 @@ def export_checkpoint(
             "training_stage": stage,
             "global_step": int(train_config.get("global_step", 0)),
             "mtp_depth": depth,
+            "branch_position_mode": train_config.get("branch_position_mode", "base"),
             "files": {path.name: _sha256(path) for path in hashed_files},
         }
         (temporary / "mtp_export_metadata.json").write_text(

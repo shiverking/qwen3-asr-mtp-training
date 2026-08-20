@@ -57,9 +57,11 @@ def test_export_stage1_creates_self_contained_index(tmp_path: Path):
     index = json.loads((output / "model.safetensors.index.json").read_text(encoding="utf-8"))
     metadata = json.loads((output / "mtp_export_metadata.json").read_text(encoding="utf-8"))
     assert config["mtp_num_hidden_layers"] == 2
+    assert config["mtp_branch_position_mode"] == "base"
     assert index["weight_map"]["mtp.layers.1.hidden_norm.weight"] == "mtp_model.safetensors"
     assert (output / "processor_config.json").is_file()
     assert metadata["training_stage"] == 1
+    assert metadata["branch_position_mode"] == "base"
     assert metadata["files"]["mtp_model.safetensors"]
 
 

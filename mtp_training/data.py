@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import random
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -84,6 +86,76 @@ class DurationBucketBatchSampler(Sampler[list[int]]):
                     batches.append(batch)
         rng.shuffle(batches)
         yield from batches
+
+
+class LanguageTemperatureBatchSampler(Sampler[list[int]]):
+    """Sample homogeneous duration-bucketed batches with tempered language weights."""
+
+    def __init__(
+        self,
+        dataset: ManifestDataset,
+        batch_size: int,
+        seed: int,
+        temperature: float = 0.5,
+        drop_last: bool = False,
+    ):
+        if not 0.0 <= temperature <= 1.0:
+            raise ValueError("temperature must be between 0 and 1")
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.seed = seed
+        self.temperature = temperature
+        self.drop_last = drop_last
+        self.epoch = 0
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for index, row in enumerate(dataset.rows):
+            grouped[row["language"]].append(index)
+        self.grouped_indices = dict(grouped)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+    def _language_batches(self, indices: list[int], rng: random.Random) -> list[list[int]]:
+        shuffled = list(indices)
+        rng.shuffle(shuffled)
+        shuffled.sort(key=lambda index: float(self.dataset.rows[index]["duration_s"]))
+        batches = [
+            shuffled[start : start + self.batch_size]
+            for start in range(0, len(shuffled), self.batch_size)
+        ]
+        if self.drop_last:
+            batches = [batch for batch in batches if len(batch) == self.batch_size]
+        rng.shuffle(batches)
+        return batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        languages = sorted(self.grouped_indices)
+        weights = [len(self.grouped_indices[key]) ** self.temperature for key in languages]
+        batches_by_language = {
+            key: self._language_batches(self.grouped_indices[key], rng) for key in languages
+        }
+        offsets = {key: 0 for key in languages}
+        for _ in range(len(self)):
+            language = rng.choices(languages, weights=weights, k=1)[0]
+            batches = batches_by_language[language]
+            if not batches:
+                continue
+            offset = offsets[language]
+            if offset >= len(batches):
+                batches = self._language_batches(self.grouped_indices[language], rng)
+                batches_by_language[language] = batches
+                offset = 0
+            batch = batches[offset]
+            offsets[language] = offset + 1
+            if len(batch) < self.batch_size and self.drop_last:
+                continue
+            yield batch
 
 
 @dataclass

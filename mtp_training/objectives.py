@@ -25,6 +25,8 @@ class BranchResult:
     loss: torch.Tensor
     correct: torch.Tensor
     valid: torch.Tensor
+    predicted: torch.Tensor
+    token_losses: torch.Tensor
 
 
 def branch_cross_entropy(
@@ -38,14 +40,52 @@ def branch_cross_entropy(
     flat_valid = valid.reshape(-1)
     if not torch.any(flat_valid):
         zero = hidden_states.sum() * 0.0
-        return BranchResult(zero, torch.zeros_like(valid), valid)
+        return BranchResult(
+            zero,
+            torch.zeros_like(valid),
+            valid,
+            torch.full_like(targets, -1),
+            torch.zeros_like(targets, dtype=torch.float32),
+        )
     logits = lm_head(flat_hidden[flat_valid])
     selected_targets = flat_targets[flat_valid]
-    loss = F.cross_entropy(logits.float(), selected_targets, reduction="mean")
-    selected_correct = logits.detach().argmax(dim=-1).eq(selected_targets)
+    selected_losses = F.cross_entropy(logits.float(), selected_targets, reduction="none")
+    loss = selected_losses.mean()
+    selected_predictions = logits.detach().argmax(dim=-1)
+    selected_correct = selected_predictions.eq(selected_targets)
     correct = torch.zeros_like(flat_valid, dtype=torch.bool)
     correct[flat_valid] = selected_correct
-    return BranchResult(loss, correct.view_as(valid), valid)
+    predicted = torch.full_like(flat_targets, -1)
+    predicted[flat_valid] = selected_predictions
+    token_losses = torch.zeros_like(flat_targets, dtype=torch.float32)
+    token_losses[flat_valid] = selected_losses.detach()
+    return BranchResult(
+        loss,
+        correct.view_as(valid),
+        valid,
+        predicted.view_as(targets),
+        token_losses.view_as(targets),
+    )
+
+
+def align_branch_with_backbone(
+    branch: BranchResult,
+    main: BranchResult,
+    branch_index: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compare MTP-k predictions with teacher-forced backbone predictions.
+
+    ``branch_index`` is one based. MTP-k at base position t and the backbone
+    at t+k both predict the token at t+k+1.
+    """
+    if branch_index < 1:
+        raise ValueError("branch_index must be >= 1")
+    width = branch.predicted.shape[1]
+    main_predictions = main.predicted[:, branch_index : branch_index + width]
+    main_valid = main.valid[:, branch_index : branch_index + width]
+    valid = branch.valid & main_valid
+    correct = branch.predicted.eq(main_predictions) & valid
+    return correct, valid
 
 
 def strict_acceptance(

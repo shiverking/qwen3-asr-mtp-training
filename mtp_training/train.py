@@ -6,6 +6,7 @@ import math
 import os
 import random
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +21,13 @@ from .checkpointing import (
     save_checkpoint,
 )
 from .config import TrainConfig
-from .data import DurationBucketBatchSampler, MTPDataCollator, ManifestDataset
+from .data import (
+    DurationBucketBatchSampler,
+    LanguageTemperatureBatchSampler,
+    MTPDataCollator,
+    ManifestDataset,
+)
+from .diagnostics import audit_initialization, audit_trainable_parameters
 from .evaluation import evaluate
 from .modeling_mtp import Qwen3ASRMTPModel
 
@@ -56,11 +63,20 @@ def build_loader(dataset, processor, config, train: bool):
         processor=processor,
         include_eos_in_loss=config.include_eos_in_loss,
     )
-    sampler = DurationBucketBatchSampler(
+    sampler_class = (
+        LanguageTemperatureBatchSampler
+        if train and config.sampler_mode == "language_temperature"
+        else DurationBucketBatchSampler
+    )
+    sampler_kwargs = {}
+    if sampler_class is LanguageTemperatureBatchSampler:
+        sampler_kwargs["temperature"] = config.language_temperature
+    sampler = sampler_class(
         dataset,
         batch_size=config.batch_size,
         seed=config.seed,
         drop_last=train,
+        **sampler_kwargs,
     )
     return DataLoader(
         dataset,
@@ -95,9 +111,29 @@ def main() -> None:
         attn_implementation=config.attn_implementation,
     )
     wrapper.processor.tokenizer.padding_side = "right"
-    model = Qwen3ASRMTPModel(wrapper.model, config.mtp_depth, config.alpha)
+    model = Qwen3ASRMTPModel(
+        wrapper.model,
+        config.mtp_depth,
+        config.alpha,
+        config.branch_position_mode,
+    )
+    initialization_audit = audit_initialization(model)
+    if not initialization_audit["passed"]:
+        raise RuntimeError(f"MTP initialization audit failed: {initialization_audit}")
     counts = model.configure_trainable(config.stage)
-    print(json.dumps({"parameter_counts": counts}, indent=2))
+    trainable_audit = audit_trainable_parameters(model, config.stage)
+    if not trainable_audit["passed"]:
+        raise RuntimeError(f"Trainable parameter audit failed: {trainable_audit}")
+    print(
+        json.dumps(
+            {
+                "parameter_counts": counts,
+                "initialization_audit": initialization_audit,
+                "trainable_parameter_audit": trainable_audit,
+            },
+            indent=2,
+        )
+    )
     device = torch.device("cuda:0")
     model.to(device)
 
@@ -129,6 +165,8 @@ def main() -> None:
     model.train()
     running_loss = 0.0
     running_started = time.perf_counter()
+    exposure_samples: Counter[str] = Counter()
+    exposure_tokens: Counter[str] = Counter()
     data_iterator = iter(train_loader)
     while global_step < config.max_steps:
         for accumulation_index in range(config.gradient_accumulation_steps):
@@ -138,8 +176,12 @@ def main() -> None:
                 train_loader.batch_sampler.set_epoch(global_step + 1)
                 data_iterator = iter(train_loader)
                 batch = next(data_iterator)
-            batch.pop("languages")
+            languages = batch.pop("languages")
             batch.pop("sample_ids")
+            token_counts = batch["loss_mask"].sum(dim=1).tolist()
+            exposure_samples.update(languages)
+            for language, count in zip(languages, token_counts):
+                exposure_tokens[language] += int(count)
             batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 output = model(stage=config.stage, **batch)
@@ -167,7 +209,20 @@ def main() -> None:
 
         if global_step % config.eval_steps == 0:
             metrics = evaluate(model, eval_loader, config.stage, device, config.eval_batches)
-            print(json.dumps({"step": global_step, "eval": metrics}, ensure_ascii=False), flush=True)
+            print(
+                json.dumps(
+                    {
+                        "step": global_step,
+                        "training_exposure": {
+                            "samples": dict(sorted(exposure_samples.items())),
+                            "transcript_tokens": dict(sorted(exposure_tokens.items())),
+                        },
+                        "eval": metrics,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
 
         if global_step % config.save_steps == 0:
             checkpoint = save_checkpoint(

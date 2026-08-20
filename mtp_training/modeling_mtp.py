@@ -14,6 +14,7 @@ from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
 
 from .objectives import (
     BranchResult,
+    align_branch_with_backbone,
     branch_cross_entropy,
     normalized_branch_weights,
     shifted_targets,
@@ -24,9 +25,17 @@ from .objectives import (
 class MTPOutput:
     loss: torch.Tensor
     main_loss: torch.Tensor
+    main_correct: torch.Tensor
+    main_valid: torch.Tensor
+    main_predictions: torch.Tensor
+    main_token_losses: torch.Tensor
     branch_losses: list[torch.Tensor]
+    branch_token_losses: list[torch.Tensor]
     branch_correct: list[torch.Tensor]
     branch_valid: list[torch.Tensor]
+    branch_predictions: list[torch.Tensor]
+    branch_backbone_correct: list[torch.Tensor]
+    branch_backbone_valid: list[torch.Tensor]
 
 
 class MTPBranch(nn.Module):
@@ -51,6 +60,7 @@ class MTPBranch(nn.Module):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         text_model: nn.Module,
+        position_offset: int = 0,
     ) -> torch.Tensor:
         fused = self.projection(
             torch.cat(
@@ -60,7 +70,9 @@ class MTPBranch(nn.Module):
         )
         sequence_length = fused.shape[1]
         cache_position = torch.arange(sequence_length, device=fused.device)
-        branch_position_ids = position_ids[..., :sequence_length]
+        branch_position_ids = position_ids[
+            ..., position_offset : position_offset + sequence_length
+        ]
         text_position_ids = branch_position_ids[0]
         causal_mask = create_causal_mask(
             config=text_model.config,
@@ -85,13 +97,22 @@ class MTPBranch(nn.Module):
 class Qwen3ASRMTPModel(nn.Module):
     """Attach ParaASR-style serial MTP branches without patching Qwen3-ASR."""
 
-    def __init__(self, asr_model: nn.Module, depth: int = 3, alpha: float = 0.9):
+    def __init__(
+        self,
+        asr_model: nn.Module,
+        depth: int = 3,
+        alpha: float = 0.9,
+        branch_position_mode: str = "base",
+    ):
         super().__init__()
         if depth < 1:
             raise ValueError("depth must be >= 1")
+        if branch_position_mode not in ("base", "shifted"):
+            raise ValueError("branch_position_mode must be base or shifted")
         self.asr_model = asr_model
         self.depth = depth
         self.alpha = alpha
+        self.branch_position_mode = branch_position_mode
         thinker = self.thinker
         text_model = thinker.model
         self.branches = nn.ModuleList(
@@ -169,6 +190,9 @@ class Qwen3ASRMTPModel(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 text_model=self.thinker.model,
+                position_offset=(
+                    branch_index if self.branch_position_mode == "shifted" else 0
+                ),
             )
             targets, valid = shifted_targets(input_ids, loss_mask, branch_index + 1)
             branch_results.append(
@@ -183,10 +207,22 @@ class Qwen3ASRMTPModel(nn.Module):
         weights = normalized_branch_weights(self.depth, self.alpha, main_hidden.device)
         mtp_loss = sum(weight * result.loss for weight, result in zip(weights, branch_results))
         loss = mtp_loss if stage == 1 else main_result.loss + mtp_loss
+        backbone_alignment = [
+            align_branch_with_backbone(result, main_result, branch_index)
+            for branch_index, result in enumerate(branch_results, start=1)
+        ]
         return MTPOutput(
             loss=loss,
             main_loss=main_result.loss,
+            main_correct=main_result.correct,
+            main_valid=main_result.valid,
+            main_predictions=main_result.predicted,
+            main_token_losses=main_result.token_losses,
             branch_losses=[result.loss for result in branch_results],
+            branch_token_losses=[result.token_losses for result in branch_results],
             branch_correct=[result.correct for result in branch_results],
             branch_valid=[result.valid for result in branch_results],
+            branch_predictions=[result.predicted for result in branch_results],
+            branch_backbone_correct=[item[0] for item in backbone_alignment],
+            branch_backbone_valid=[item[1] for item in backbone_alignment],
         )
