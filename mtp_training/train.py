@@ -84,6 +84,25 @@ def build_loader(dataset, processor, config, train: bool):
         if train and config.sampler_mode == "language_temperature"
         else DurationBucketBatchSampler
     )
+    sampler_kwargs = {}
+    if sampler_class is LanguageTemperatureBatchSampler:
+        sampler_kwargs["temperature"] = config.language_temperature
+    sampler = sampler_class(
+        dataset,
+        batch_size=config.batch_size,
+        seed=config.seed,
+        drop_last=train,
+        **sampler_kwargs,
+    )
+    return DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=collator,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        persistent_workers=config.num_workers > 0,
+        prefetch_factor=2 if config.num_workers > 0 else None,
+    )
 
 
 def append_metric(path: Path, payload: dict) -> None:
@@ -109,25 +128,34 @@ def concise_eval(step: int, metrics: dict, reference_metrics: dict | None) -> st
         f"bb={macro['decode_window_backbone_consistency_average_accepted_length']:.3f}"
         f"{reference} | {language_bb}"
     )
-    sampler_kwargs = {}
-    if sampler_class is LanguageTemperatureBatchSampler:
-        sampler_kwargs["temperature"] = config.language_temperature
-    sampler = sampler_class(
-        dataset,
-        batch_size=config.batch_size,
-        seed=config.seed,
-        drop_last=train,
-        **sampler_kwargs,
-    )
-    return DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        collate_fn=collator,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        persistent_workers=config.num_workers > 0,
-        prefetch_factor=2 if config.num_workers > 0 else None,
-    )
+
+
+def summarize_training_data(dataset, loader, config) -> dict:
+    samples_by_language: Counter[str] = Counter()
+    seconds_by_language: Counter[str] = Counter()
+    for row in dataset.rows:
+        language = row["language"]
+        samples_by_language[language] += 1
+        seconds_by_language[language] += float(row["duration_s"])
+    batches_per_epoch = len(loader)
+    planned_batches = config.max_steps * config.gradient_accumulation_steps
+    return {
+        "manifest": str(dataset.manifest_path),
+        "samples": len(dataset),
+        "hours": sum(seconds_by_language.values()) / 3600,
+        "samples_by_language": dict(sorted(samples_by_language.items())),
+        "hours_by_language": {
+            language: seconds / 3600
+            for language, seconds in sorted(seconds_by_language.items())
+        },
+        "batches_per_epoch": batches_per_epoch,
+        "samples_per_full_epoch": batches_per_epoch * config.batch_size,
+        "planned_optimizer_steps": config.max_steps,
+        "planned_sample_exposures": (
+            planned_batches * config.batch_size
+        ),
+        "planned_epochs": planned_batches / max(batches_per_epoch, 1),
+    }
 
 
 def main() -> None:
@@ -191,6 +219,22 @@ def main() -> None:
     )
     train_loader = build_loader(train_dataset, wrapper.processor, config, train=True)
     eval_loader = build_loader(eval_dataset, wrapper.processor, config, train=False)
+    data_summary = summarize_training_data(train_dataset, train_loader, config)
+    startup_audit["training_data"] = data_summary
+    (output_dir / "startup_audit.json").write_text(
+        json.dumps(startup_audit, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    language_hours = ", ".join(
+        f"{language}={hours:.1f}h"
+        for language, hours in data_summary["hours_by_language"].items()
+    )
+    print(
+        f"data samples={data_summary['samples']:,} hours={data_summary['hours']:.2f} "
+        f"batches/epoch={data_summary['batches_per_epoch']:,} "
+        f"planned_epochs={data_summary['planned_epochs']:.3f}",
+        flush=True,
+    )
+    print(f"data languages {language_hours}", flush=True)
 
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(
