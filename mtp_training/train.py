@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from qwen_asr import Qwen3ASRModel
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from .checkpointing import (
     load_trainable_weights,
@@ -83,6 +84,31 @@ def build_loader(dataset, processor, config, train: bool):
         if train and config.sampler_mode == "language_temperature"
         else DurationBucketBatchSampler
     )
+
+
+def append_metric(path: Path, payload: dict) -> None:
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def concise_eval(step: int, metrics: dict, reference_metrics: dict | None) -> str:
+    macro = metrics["macro_average"]
+    language_bb = ", ".join(
+        f"{language}={values['decode_window_backbone_consistency_average_accepted_length']:.2f}"
+        for language, values in metrics.items()
+        if language not in ("all", "macro_average")
+    )
+    reference = (
+        f" ref={reference_metrics['average_accepted_length']:.2f}"
+        if reference_metrics is not None
+        else ""
+    )
+    return (
+        f"eval step={step} loss={macro['loss']:.4f} "
+        f"gt={macro['decode_window_ground_truth_average_accepted_length']:.3f} "
+        f"bb={macro['decode_window_backbone_consistency_average_accepted_length']:.3f}"
+        f"{reference} | {language_bb}"
+    )
     sampler_kwargs = {}
     if sampler_class is LanguageTemperatureBatchSampler:
         sampler_kwargs["temperature"] = config.language_temperature
@@ -115,6 +141,7 @@ def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "metrics.jsonl"
     (output_dir / "resolved_config.json").write_text(
         json.dumps(config.__dict__, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -140,15 +167,18 @@ def main() -> None:
     trainable_audit = audit_trainable_parameters(model, config.stage)
     if not trainable_audit["passed"]:
         raise RuntimeError(f"Trainable parameter audit failed: {trainable_audit}")
+    startup_audit = {
+        "parameter_counts": counts,
+        "initialization_audit": initialization_audit,
+        "trainable_parameter_audit": trainable_audit,
+    }
+    (output_dir / "startup_audit.json").write_text(
+        json.dumps(startup_audit, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     print(
-        json.dumps(
-            {
-                "parameter_counts": counts,
-                "initialization_audit": initialization_audit,
-                "trainable_parameter_audit": trainable_audit,
-            },
-            indent=2,
-        )
+        f"startup audit=passed trainable={counts['trainable']:,} "
+        f"total={counts['total']:,}",
+        flush=True,
     )
     device = torch.device("cuda:0")
     model.to(device)
@@ -186,8 +216,15 @@ def main() -> None:
     data_iterator = iter(train_loader)
     backbone_acceptance_history: list[float] = []
     stop_requested = False
+    progress = tqdm(
+        total=config.max_steps,
+        initial=global_step,
+        desc=f"MTP-{config.mtp_depth} stage-{config.stage}",
+        unit="step",
+        dynamic_ncols=True,
+    )
     while global_step < config.max_steps:
-        for accumulation_index in range(config.gradient_accumulation_steps):
+        for _ in range(config.gradient_accumulation_steps):
             try:
                 batch = next(data_iterator)
             except StopIteration:
@@ -211,6 +248,7 @@ def main() -> None:
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         global_step += 1
+        progress.update(1)
 
         if global_step % config.log_steps == 0:
             elapsed = time.perf_counter() - running_started
@@ -221,7 +259,14 @@ def main() -> None:
                 "steps_per_second": config.log_steps / elapsed,
                 "max_memory_gib": torch.cuda.max_memory_allocated() / 2**30,
             }
-            print(json.dumps(payload, ensure_ascii=False), flush=True)
+            append_metric(metrics_path, {"event": "train", **payload})
+            progress.set_postfix(
+                loss=f"{payload['loss']:.4f}",
+                lr=f"{payload['learning_rate']:.2e}",
+                speed=f"{payload['steps_per_second']:.2f}/s",
+                memory=f"{payload['max_memory_gib']:.1f}GiB",
+                refresh=True,
+            )
             running_loss = 0.0
             running_started = time.perf_counter()
 
@@ -233,7 +278,11 @@ def main() -> None:
                 ]
             )
             reference_metrics = None
-            if config.reference_eval_samples:
+            if (
+                config.reference_eval_samples
+                and config.reference_eval_steps
+                and global_step % config.reference_eval_steps == 0
+            ):
                 from .reference_verifier import evaluate_speculative_reference
 
                 reference_metrics = evaluate_speculative_reference(
@@ -251,42 +300,29 @@ def main() -> None:
                     json.dumps(reference_metrics, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-            print(
-                json.dumps(
-                    {
-                        "step": global_step,
-                        "training_exposure": {
-                            "samples": dict(sorted(exposure_samples.items())),
-                            "transcript_tokens": dict(sorted(exposure_tokens.items())),
-                        },
-                        "eval": metrics,
-                        "reference_eval": (
-                            {key: value for key, value in reference_metrics.items() if key != "results"}
-                            if reference_metrics is not None
-                            else None
-                        ),
-                    },
-                    ensure_ascii=False,
+            eval_payload = {
+                "event": "eval",
+                "step": global_step,
+                "training_exposure": {
+                    "samples": dict(sorted(exposure_samples.items())),
+                    "transcript_tokens": dict(sorted(exposure_tokens.items())),
+                },
+                "eval": metrics,
+                "reference_eval": (
+                    {key: value for key, value in reference_metrics.items() if key != "results"}
+                    if reference_metrics is not None
+                    else None
                 ),
-                flush=True,
-            )
+            }
+            append_metric(metrics_path, eval_payload)
+            progress.write(concise_eval(global_step, metrics, reference_metrics))
             stop_requested = should_stop_for_plateau(
                 backbone_acceptance_history, global_step, config
             )
             if stop_requested:
-                print(
-                    json.dumps(
-                        {
-                            "early_stop": True,
-                            "step": global_step,
-                            "metric": "macro_average.decode_window_backbone_consistency_average_accepted_length",
-                            "recent_values": backbone_acceptance_history[
-                                -(config.early_stop_patience_evals + 1) :
-                            ],
-                            "min_delta": config.early_stop_min_delta,
-                        }
-                    ),
-                    flush=True,
+                progress.write(
+                    f"early stop step={global_step} bb_recent="
+                    f"{backbone_acceptance_history[-(config.early_stop_patience_evals + 1):]}"
                 )
 
         if global_step % config.save_steps == 0:
@@ -294,10 +330,11 @@ def main() -> None:
                 output_dir, global_step, model, optimizer, scheduler, config
             )
             prune_checkpoints(output_dir, config.save_total_limit)
-            print(f"Saved {checkpoint}", flush=True)
+            progress.write(f"saved {checkpoint}")
 
         if stop_requested:
             break
+    progress.close()
 
     if global_step % config.save_steps:
         save_checkpoint(output_dir, global_step, model, optimizer, scheduler, config)

@@ -41,6 +41,7 @@ class TrainConfig:
     loss_reduction: str = "token_mean"
     reference_eval_samples: int = 0
     reference_eval_max_new_tokens: int = 64
+    reference_eval_steps: int = 0
     early_stop_after_step: int = 0
     early_stop_patience_evals: int = 3
     early_stop_min_delta: float = 0.03
@@ -70,6 +71,8 @@ class TrainConfig:
             raise ValueError("reference_eval_samples must be >= 0")
         if config.reference_eval_max_new_tokens < 1:
             raise ValueError("reference_eval_max_new_tokens must be >= 1")
+        if config.reference_eval_steps < 0:
+            raise ValueError("reference_eval_steps must be >= 0")
         if config.early_stop_after_step < 0:
             raise ValueError("early_stop_after_step must be >= 0")
         if config.early_stop_patience_evals < 1:
