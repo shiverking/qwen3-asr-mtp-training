@@ -104,3 +104,19 @@ The implementation deliberately stays outside `vLLM` and Ascend 310P code.
 Once MTP-3 quality is accepted, export/inference integration should be handled
 as a separate commit so training behavior and deployment changes remain easy to
 review and revert independently.
+# Export for vLLM deployment
+
+Export only a completed checkpoint (one that contains `trainable_model.safetensors`,
+`trainer_state.pt`, and `mtp_config.json`). The exporter never reads a moving
+"latest" pointer and writes the destination atomically:
+
+```bash
+python -m mtp_training.export_checkpoint \
+  --base-model /models/Qwen3-ASR-1.7B \
+  --checkpoint /root/autodl-tmp/outputs/mtp3-stage1/checkpoint-2000 \
+  --output-dir /models/Qwen3-ASR-1.7B-MTP3
+```
+
+The result is a self-contained Hugging Face directory. Stage 1 exports the
+original backbone plus MTP layers; Stage 2 overlays the jointly trained backbone
+weights before adding the MTP layers.
