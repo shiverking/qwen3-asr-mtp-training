@@ -99,6 +99,24 @@ def strict_acceptance(
     if not branch_correct:
         raise ValueError("At least one MTP branch is required")
     width = min(item.shape[1] for item in branch_correct)
+    eligible = torch.ones_like(branch_valid[-1][:, :width])
+    for valid in branch_valid:
+        eligible &= valid[:, :width]
+    prefix_ok = torch.ones_like(eligible)
+    accepted = eligible.to(torch.float32)
+    for correct, valid in zip(branch_correct, branch_valid):
+        prefix_ok &= correct[:, :width] & valid[:, :width]
+        accepted += prefix_ok.to(torch.float32)
+    return accepted.sum(), eligible.sum()
+
+
+def legacy_strict_acceptance(
+    branch_correct: list[torch.Tensor], branch_valid: list[torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reproduce the version-1 metric that used only the deepest validity mask."""
+    if not branch_correct:
+        raise ValueError("At least one MTP branch is required")
+    width = min(item.shape[1] for item in branch_correct)
     eligible = branch_valid[-1][:, :width].clone()
     prefix_ok = torch.ones_like(eligible)
     accepted = eligible.to(torch.float32)
@@ -106,3 +124,15 @@ def strict_acceptance(
         prefix_ok &= correct[:, :width] & valid[:, :width]
         accepted += prefix_ok.to(torch.float32)
     return accepted.sum(), eligible.sum()
+
+
+def decode_window_validity(
+    main_valid: torch.Tensor,
+    branch_valid: list[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Require the normal AR token and each future target to be transcript tokens."""
+    result = []
+    for valid in branch_valid:
+        width = min(main_valid.shape[1], valid.shape[1])
+        result.append(valid[:, :width] & main_valid[:, :width])
+    return result

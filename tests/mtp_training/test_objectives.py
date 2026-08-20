@@ -3,6 +3,8 @@ import torch
 from mtp_training.objectives import (
     BranchResult,
     align_branch_with_backbone,
+    decode_window_validity,
+    legacy_strict_acceptance,
     normalized_branch_weights,
     shifted_targets,
     strict_acceptance,
@@ -34,6 +36,32 @@ def test_strict_acceptance_stops_after_first_rejection():
     # Per position: 3, 2, 1 accepted tokens including the normal AR token.
     assert accepted.item() == 6
     assert positions.item() == 3
+
+
+def test_decode_window_requires_main_and_future_targets_inside_transcript():
+    loss_mask = torch.tensor([[False, False, False, True, True, True, True, False]])
+    main_valid = loss_mask[:, 1:]
+    branch_valid = [loss_mask[:, offset:] for offset in (2, 3, 4)]
+    decode_valid = decode_window_validity(main_valid, branch_valid)
+    assert [int(valid.sum()) for valid in decode_valid] == [3, 2, 1]
+    correct = [torch.ones_like(valid) for valid in decode_valid]
+    accepted, positions = strict_acceptance(correct, decode_valid)
+    assert positions.item() == 1
+    assert accepted.item() == 4
+
+
+def test_strict_acceptance_intersects_validity_but_legacy_uses_deepest_only():
+    correct = [torch.ones((1, 2), dtype=torch.bool) for _ in range(2)]
+    valid = [
+        torch.tensor([[False, True]]),
+        torch.tensor([[True, True]]),
+    ]
+    accepted, positions = strict_acceptance(correct, valid)
+    legacy_accepted, legacy_positions = legacy_strict_acceptance(correct, valid)
+    assert positions.item() == 1
+    assert accepted.item() == 3
+    assert legacy_positions.item() == 2
+    assert legacy_accepted.item() == 4
 
 
 def test_branch_prediction_is_aligned_with_shifted_backbone_position():
