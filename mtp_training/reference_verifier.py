@@ -1,8 +1,37 @@
 from __future__ import annotations
 
+import random
+from collections import defaultdict
 from typing import Any
 
 import torch
+
+
+def stratified_indices(dataset, total: int, seed: int) -> list[int]:
+    grouped = defaultdict(list)
+    for index, row in enumerate(dataset.rows):
+        grouped[row["language"]].append(index)
+    rng = random.Random(seed)
+    languages = sorted(grouped)
+    base, remainder = divmod(total, len(languages))
+    selected = []
+    for index, language in enumerate(languages):
+        count = base + (1 if index < remainder else 0)
+        selected.extend(rng.sample(grouped[language], min(count, len(grouped[language]))))
+    return selected
+
+
+def prefix_batch(collator, row, device) -> dict[str, Any]:
+    batch = collator([row])
+    loss_positions = batch["loss_mask"][0].nonzero(as_tuple=False).flatten()
+    if loss_positions.numel() == 0:
+        raise ValueError(f"No transcript tokens for {row['id']}")
+    prefix_length = int(loss_positions[0])
+    batch.pop("languages")
+    batch.pop("sample_ids")
+    for key in ("input_ids", "attention_mask", "loss_mask"):
+        batch[key] = batch[key][:, :prefix_length]
+    return {key: value.to(device) for key, value in batch.items()}
 
 
 def _append_token(batch: dict[str, Any], token: torch.Tensor) -> dict[str, Any]:
@@ -22,7 +51,10 @@ def _backbone_next(model, batch: dict[str, Any]) -> torch.Tensor:
     return model.thinker.lm_head(hidden[:, -1]).argmax(dim=-1)
 
 
-def _draft_next(model, batch: dict[str, Any], depth: int, base_position: int) -> torch.Tensor:
+def draft_next_token(
+    model, batch: dict[str, Any], depth: int, base_position: int
+) -> torch.Tensor:
+    """Return one serial MTP proposal for a fixed autoregressive base position."""
     hidden, position_ids = model._backbone_hidden(batch)
     token_embedding = model.thinker.get_input_embeddings()
     for branch_index in range(1, depth + 1):
@@ -66,7 +98,7 @@ def speculative_greedy_reference(
         draft_context = context
         drafts = []
         for depth in range(1, model.depth + 1):
-            proposal = _draft_next(model, draft_context, depth, base_position)
+            proposal = draft_next_token(model, draft_context, depth, base_position)
             drafts.append(proposal)
             draft_context = _append_token(draft_context, proposal)
 
@@ -103,3 +135,45 @@ def speculative_greedy_reference(
             sum(accepted_lengths) / len(accepted_lengths) if accepted_lengths else 0.0
         ),
     }
+
+
+@torch.no_grad()
+def evaluate_speculative_reference(
+    model,
+    dataset,
+    collator,
+    device,
+    eos_token_id: int | None,
+    samples: int,
+    max_new_tokens: int,
+    seed: int,
+) -> dict[str, Any]:
+    was_training = model.training
+    model.eval()
+    results = []
+    autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    for index in stratified_indices(dataset, samples, seed):
+        row = dataset[index]
+        prefix = prefix_batch(collator, row, device)
+        with autocast:
+            result = speculative_greedy_reference(
+                model, prefix, eos_token_id, max_new_tokens
+            )
+        result.update({"id": row["id"], "language": row["language"]})
+        results.append(result)
+    by_language = defaultdict(list)
+    for result in results:
+        by_language[result["language"]].append(result["average_accepted_length"])
+    summary = {
+        "samples": len(results),
+        "average_accepted_length": sum(
+            value for values in by_language.values() for value in values
+        )
+        / max(len(results), 1),
+        "by_language": {
+            key: sum(values) / len(values) for key, values in sorted(by_language.items())
+        },
+        "results": results,
+    }
+    model.train(was_training)
+    return summary

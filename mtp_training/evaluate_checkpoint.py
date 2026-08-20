@@ -14,11 +14,37 @@ from .diagnostics import (
     audit_future_token_causality,
     audit_gradients,
     audit_initialization,
+    audit_reference_equivalence,
     audit_trainable_parameters,
 )
 from .evaluation import evaluate
 from .modeling_mtp import Qwen3ASRMTPModel
 from .train import build_loader, seed_everything
+
+
+def _sample_ids_from_report(path: str | None) -> list[str] | None:
+    if not path:
+        return None
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    results = payload.get("results")
+    if not isinstance(results, list):
+        raise ValueError("Verifier report must contain a results list")
+    sample_ids = [item.get("id") for item in results]
+    if not sample_ids or any(not isinstance(item, str) for item in sample_ids):
+        raise ValueError("Every verifier result must contain a string id")
+    if len(sample_ids) != len(set(sample_ids)):
+        raise ValueError("Verifier report contains duplicate sample ids")
+    return sample_ids
+
+
+def _filter_dataset_rows(dataset, sample_ids: list[str] | None) -> None:
+    if sample_ids is None:
+        return
+    rows_by_id = {row["id"]: row for row in dataset.rows}
+    missing = [sample_id for sample_id in sample_ids if sample_id not in rows_by_id]
+    if missing:
+        raise ValueError(f"Sample ids missing from eval manifest: {missing[:10]}")
+    dataset.rows = [rows_by_id[sample_id] for sample_id in sample_ids]
 
 
 def main() -> None:
@@ -27,6 +53,16 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output", default="reports/checkpoint-diagnostics.json")
     parser.add_argument("--gradient-check", action="store_true")
+    parser.add_argument(
+        "--sample-ids-from",
+        help="Restrict evaluation to ids in a verify_checkpoint JSON report",
+    )
+    parser.add_argument("--equivalence-samples", type=int, default=8)
+    parser.add_argument(
+        "--deterministic-causality",
+        action="store_true",
+        help="Gate on a float32, batch-size-one causality audit",
+    )
     args = parser.parse_args()
     config = TrainConfig.from_yaml(args.config)
     if not torch.cuda.is_available():
@@ -44,6 +80,7 @@ def main() -> None:
         config.mtp_depth,
         config.alpha,
         config.branch_position_mode,
+        config.loss_reduction,
     )
     initialization = audit_initialization(model)
     model.configure_trainable(config.stage)
@@ -54,14 +91,30 @@ def main() -> None:
     dataset = ManifestDataset(
         config.resolve_manifest(config.eval_manifest), config.dataset_root
     )
+    _filter_dataset_rows(dataset, _sample_ids_from_report(args.sample_ids_from))
     loader = build_loader(dataset, wrapper.processor, config, train=False)
     first = next(iter(loader))
     first.pop("languages")
-    first.pop("sample_ids")
+    sample_ids = first.pop("sample_ids")
     first = {key: value.to(device, non_blocking=True) for key, value in first.items()}
     model.eval()
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        causality = audit_future_token_causality(model, config.stage, first)
+        operational_causality = audit_future_token_causality(model, config.stage, first)
+        equivalence = audit_reference_equivalence(
+            model,
+            config.stage,
+            first,
+            sample_ids=sample_ids,
+            max_samples=args.equivalence_samples,
+        )
+    deterministic_causality = None
+    if args.deterministic_causality:
+        model.float()
+        fp32_first = {key: value[:1] for key, value in first.items()}
+        deterministic_causality = audit_future_token_causality(
+            model, config.stage, fp32_first
+        )
+        model.bfloat16()
     gradients = None
     if args.gradient_check:
         model.train()
@@ -76,7 +129,14 @@ def main() -> None:
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "initialization": initialization,
         "trainable_parameters": trainable,
-        "future_token_causality": causality,
+        "future_token_causality": {
+            "operational_bf16": operational_causality,
+            "deterministic_fp32": deterministic_causality,
+            "gate_mode": (
+                "deterministic_fp32" if args.deterministic_causality else "not_run"
+            ),
+        },
+        "reference_equivalence": equivalence,
         "gradients": gradients,
         "metrics": metrics,
     }
@@ -86,7 +146,17 @@ def main() -> None:
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    if not initialization["passed"] or not trainable["passed"] or not causality["passed"]:
+    causality_passed = (
+        deterministic_causality["passed"]
+        if deterministic_causality is not None
+        else True
+    )
+    if (
+        not initialization["passed"]
+        or not trainable["passed"]
+        or not causality_passed
+        or not equivalence["passed"]
+    ):
         raise SystemExit(2)
 
 

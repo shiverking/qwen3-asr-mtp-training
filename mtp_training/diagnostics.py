@@ -4,6 +4,8 @@ from typing import Any
 
 import torch
 
+from .reference_verifier import draft_next_token
+
 
 def audit_initialization(model) -> dict[str, Any]:
     """Verify copied decoder weights and absence of parameter sharing at init."""
@@ -93,8 +95,9 @@ def audit_gradients(model, stage: int) -> dict[str, Any]:
 
 @torch.no_grad()
 def audit_future_token_causality(model, stage: int, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
-    """Perturb the final supervised token and verify earlier predictions are stable."""
+    """Compare repeatability with the effect of perturbing a future token."""
     original = model(stage=stage, **batch)
+    repeated = model(stage=stage, **batch)
     modified = {key: value.clone() for key, value in batch.items()}
     input_ids = modified["input_ids"]
     loss_mask = modified["loss_mask"]
@@ -108,25 +111,137 @@ def audit_future_token_causality(model, stage: int, batch: dict[str, torch.Tenso
         input_ids[row, position] = (input_ids[row, position] + 1) % model.thinker.model.config.vocab_size
         changed_positions.append(position)
     perturbed = model(stage=stage, **modified)
-    mismatches = {"main": 0, "branches": [0] * model.depth}
+    baseline_mismatches = {"main": 0, "branches": [0] * model.depth}
+    perturbed_mismatches = {"main": 0, "branches": [0] * model.depth}
     compared = {"main": 0, "branches": [0] * model.depth}
     for row, changed_position in enumerate(changed_positions):
         if changed_position is None:
             continue
         main_width = min(changed_position, original.main_predictions.shape[1])
         compared["main"] += main_width
-        mismatches["main"] += int(
+        baseline_mismatches["main"] += int(
+            original.main_predictions[row, :main_width]
+            .ne(repeated.main_predictions[row, :main_width])
+            .sum()
+        )
+        perturbed_mismatches["main"] += int(
             original.main_predictions[row, :main_width]
             .ne(perturbed.main_predictions[row, :main_width])
             .sum()
         )
-        for branch_index, (before, after) in enumerate(
-            zip(original.branch_predictions, perturbed.branch_predictions), start=1
+        for branch_index, (before, repeat, after) in enumerate(
+            zip(
+                original.branch_predictions,
+                repeated.branch_predictions,
+                perturbed.branch_predictions,
+            ),
+            start=1,
         ):
             width = min(max(changed_position - branch_index, 0), before.shape[1])
             compared["branches"][branch_index - 1] += width
-            mismatches["branches"][branch_index - 1] += int(
+            baseline_mismatches["branches"][branch_index - 1] += int(
+                before[row, :width].ne(repeat[row, :width]).sum()
+            )
+            perturbed_mismatches["branches"][branch_index - 1] += int(
                 before[row, :width].ne(after[row, :width]).sum()
             )
-    passed = mismatches["main"] == 0 and not any(mismatches["branches"])
-    return {"passed": passed, "compared": compared, "mismatches": mismatches}
+    net_new_mismatches = {
+        "main": max(
+            perturbed_mismatches["main"] - baseline_mismatches["main"], 0
+        ),
+        "branches": [
+            max(perturbed - baseline, 0)
+            for perturbed, baseline in zip(
+                perturbed_mismatches["branches"], baseline_mismatches["branches"]
+            )
+        ],
+    }
+    repeatable = baseline_mismatches["main"] == 0 and not any(
+        baseline_mismatches["branches"]
+    )
+    passed = (
+        repeatable
+        and net_new_mismatches["main"] == 0
+        and not any(net_new_mismatches["branches"])
+    )
+    return {
+        "passed": passed,
+        "repeatable": repeatable,
+        "compared": compared,
+        "baseline_mismatches": baseline_mismatches,
+        "perturbed_mismatches": perturbed_mismatches,
+        "net_new_mismatches": net_new_mismatches,
+        # Compatibility alias for version-1 reports.
+        "mismatches": perturbed_mismatches,
+    }
+
+
+def _slice_row_prefix(
+    batch: dict[str, torch.Tensor], row: int, prefix_length: int
+) -> dict[str, torch.Tensor]:
+    result = {}
+    for key, value in batch.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        selected = value[row : row + 1]
+        if key in ("input_ids", "attention_mask", "loss_mask"):
+            selected = selected[:, :prefix_length]
+        result[key] = selected
+    return result
+
+
+@torch.no_grad()
+def audit_reference_equivalence(
+    model,
+    stage: int,
+    batch: dict[str, torch.Tensor],
+    sample_ids: list[str] | None = None,
+    max_samples: int = 8,
+) -> dict[str, Any]:
+    """Match training-path branch predictions against reference draft inference."""
+    training = model(stage=stage, **batch)
+    compared = [0] * model.depth
+    matches = [0] * model.depth
+    failures: list[dict[str, Any]] = []
+    rows = min(batch["input_ids"].shape[0], max_samples)
+    for row in range(rows):
+        sample_id = sample_ids[row] if sample_ids else str(row)
+        for branch_index in range(1, model.depth + 1):
+            branch_valid = training.branch_valid[branch_index - 1][row]
+            width = branch_valid.shape[0]
+            decode_valid = branch_valid & training.main_valid[row, :width]
+            valid_positions = decode_valid.nonzero(as_tuple=False).flatten()
+            if valid_positions.numel() == 0:
+                continue
+            base_position = int(valid_positions[0])
+            prefix_length = base_position + branch_index + 1
+            prefix = _slice_row_prefix(batch, row, prefix_length)
+            inferred = draft_next_token(
+                model, prefix, branch_index, base_position
+            )
+            expected = training.branch_predictions[branch_index - 1][
+                row, base_position
+            ]
+            compared[branch_index - 1] += 1
+            equal = int(inferred[0]) == int(expected)
+            matches[branch_index - 1] += int(equal)
+            if not equal:
+                failures.append(
+                    {
+                        "sample_id": sample_id,
+                        "branch": branch_index,
+                        "base_position": base_position,
+                        "training_token": int(expected),
+                        "reference_token": int(inferred[0]),
+                    }
+                )
+    accuracy = [
+        match / count if count else 0.0 for match, count in zip(matches, compared)
+    ]
+    return {
+        "passed": all(count > 0 and match == count for match, count in zip(matches, compared)),
+        "compared": compared,
+        "matches": matches,
+        "accuracy": accuracy,
+        "failures": failures,
+    }
