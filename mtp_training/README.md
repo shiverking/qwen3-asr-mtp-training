@@ -228,6 +228,51 @@ python -m mtp_training.train --config configs/mtp3-position-ab-base-seed2.yaml
 python -m mtp_training.train --config configs/mtp3-position-ab-shifted-seed2.yaml
 ```
 
+### Round-3 verifier and Stage-1 gate
+
+The BF16 causality result is operational telemetry. Use the deterministic
+float32, batch-size-one result as the gate, and verify that serial draft
+inference exactly matches the training path:
+
+```bash
+python -m mtp_training.evaluate_checkpoint \
+  --config configs/mtp3-overfit-mixed.yaml \
+  --checkpoint /root/autodl-tmp/outputs/mtp3-overfit-mixed/checkpoint-1000 \
+  --output reports/mixed-diagnostics-v3.json \
+  --deterministic-causality \
+  --equivalence-samples 8
+```
+
+After generating a slow verifier report, evaluate exactly the same IDs with:
+
+```bash
+python -m mtp_training.evaluate_checkpoint \
+  --config configs/mtp3-overfit-mixed.yaml \
+  --checkpoint /root/autodl-tmp/outputs/mtp3-overfit-mixed/checkpoint-1000 \
+  --sample-ids-from reports/mixed-reference-100.json \
+  --output reports/mixed-same-samples.json \
+  --deterministic-causality
+```
+
+Compare token-weighted and sample-balanced loss from fresh initialization:
+
+```bash
+python -m mtp_training.train --config configs/mtp3-loss-ab-token.yaml
+python -m mtp_training.train --config configs/mtp3-loss-ab-sample.yaml
+```
+
+Both A/B configs default to `branch_position_mode: base`. If the two-seed
+position experiment selects `shifted`, change that field in both loss configs
+before running them. Keep the same value in both files.
+
+`configs/mtp3-stage1-gated.yaml` is the clean 3,500-step production-data run.
+It starts from the official backbone and writes a deterministic fixed-sample
+reference report at every 250-step evaluation. Before launch, copy only the
+winning `branch_position_mode` and `loss_reduction` values into this config;
+never initialize it from a diagnostic checkpoint. Starting at step 2,500 it
+stops automatically when three consecutive macro backbone-consistency gains
+are each below 0.03, and saves the stopping checkpoint.
+
 For the first MTP-3 run, continue to Stage 2 only if the Stage-1 dev result is
 stable over two evaluations and global average accepted length is at least
 `3.0 / 4`. A commercial inference claim still requires a real propose/verify

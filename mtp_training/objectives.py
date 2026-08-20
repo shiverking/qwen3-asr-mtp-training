@@ -34,7 +34,10 @@ def branch_cross_entropy(
     lm_head,
     targets: torch.Tensor,
     valid: torch.Tensor,
+    reduction: str = "token_mean",
 ) -> BranchResult:
+    if reduction not in ("token_mean", "sample_mean"):
+        raise ValueError("reduction must be token_mean or sample_mean")
     flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_targets = targets.reshape(-1)
     flat_valid = valid.reshape(-1)
@@ -50,7 +53,19 @@ def branch_cross_entropy(
     logits = lm_head(flat_hidden[flat_valid])
     selected_targets = flat_targets[flat_valid]
     selected_losses = F.cross_entropy(logits.float(), selected_targets, reduction="none")
-    loss = selected_losses.mean()
+    if reduction == "token_mean":
+        loss = selected_losses.mean()
+    else:
+        row_indices = valid.nonzero(as_tuple=False)[:, 0]
+        sample_loss_sums = torch.zeros(
+            valid.shape[0], device=selected_losses.device, dtype=selected_losses.dtype
+        ).scatter_add(0, row_indices, selected_losses)
+        sample_token_counts = valid.sum(dim=1)
+        samples_with_targets = sample_token_counts > 0
+        loss = (
+            sample_loss_sums[samples_with_targets]
+            / sample_token_counts[samples_with_targets]
+        ).mean()
     selected_predictions = logits.detach().argmax(dim=-1)
     selected_correct = selected_predictions.eq(selected_targets)
     correct = torch.zeros_like(flat_valid, dtype=torch.bool)

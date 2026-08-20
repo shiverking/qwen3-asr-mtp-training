@@ -29,3 +29,10 @@ def test_rejects_unknown_branch_position_mode(tmp_path: Path):
     config.write_text("branch_position_mode: absolute\n", encoding="utf-8")
     with pytest.raises(ValueError, match="branch_position_mode"):
         TrainConfig.from_yaml(config)
+
+
+def test_rejects_unknown_loss_reduction(tmp_path: Path):
+    config = tmp_path / "bad-loss.yaml"
+    config.write_text("loss_reduction: batch_mean\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="loss_reduction"):
+        TrainConfig.from_yaml(config)

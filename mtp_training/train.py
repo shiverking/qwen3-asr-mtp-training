@@ -58,6 +58,21 @@ def build_scheduler(optimizer, config: TrainConfig):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
 
 
+def should_stop_for_plateau(
+    history: list[float], global_step: int, config: TrainConfig
+) -> bool:
+    if not config.early_stop_after_step or global_step < config.early_stop_after_step:
+        return False
+    required = config.early_stop_patience_evals + 1
+    if len(history) < required:
+        return False
+    recent = history[-required:]
+    return all(
+        current - previous < config.early_stop_min_delta
+        for previous, current in zip(recent, recent[1:])
+    )
+
+
 def build_loader(dataset, processor, config, train: bool):
     collator = MTPDataCollator(
         processor=processor,
@@ -116,6 +131,7 @@ def main() -> None:
         config.mtp_depth,
         config.alpha,
         config.branch_position_mode,
+        config.loss_reduction,
     )
     initialization_audit = audit_initialization(model)
     if not initialization_audit["passed"]:
@@ -168,6 +184,8 @@ def main() -> None:
     exposure_samples: Counter[str] = Counter()
     exposure_tokens: Counter[str] = Counter()
     data_iterator = iter(train_loader)
+    backbone_acceptance_history: list[float] = []
+    stop_requested = False
     while global_step < config.max_steps:
         for accumulation_index in range(config.gradient_accumulation_steps):
             try:
@@ -209,6 +227,30 @@ def main() -> None:
 
         if global_step % config.eval_steps == 0:
             metrics = evaluate(model, eval_loader, config.stage, device, config.eval_batches)
+            backbone_acceptance_history.append(
+                metrics["macro_average"][
+                    "decode_window_backbone_consistency_average_accepted_length"
+                ]
+            )
+            reference_metrics = None
+            if config.reference_eval_samples:
+                from .reference_verifier import evaluate_speculative_reference
+
+                reference_metrics = evaluate_speculative_reference(
+                    model,
+                    eval_dataset,
+                    eval_loader.collate_fn,
+                    device,
+                    wrapper.processor.tokenizer.eos_token_id,
+                    config.reference_eval_samples,
+                    config.reference_eval_max_new_tokens,
+                    config.seed,
+                )
+                reference_path = output_dir / f"reference-step-{global_step}.json"
+                reference_path.write_text(
+                    json.dumps(reference_metrics, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
             print(
                 json.dumps(
                     {
@@ -218,11 +260,34 @@ def main() -> None:
                             "transcript_tokens": dict(sorted(exposure_tokens.items())),
                         },
                         "eval": metrics,
+                        "reference_eval": (
+                            {key: value for key, value in reference_metrics.items() if key != "results"}
+                            if reference_metrics is not None
+                            else None
+                        ),
                     },
                     ensure_ascii=False,
                 ),
                 flush=True,
             )
+            stop_requested = should_stop_for_plateau(
+                backbone_acceptance_history, global_step, config
+            )
+            if stop_requested:
+                print(
+                    json.dumps(
+                        {
+                            "early_stop": True,
+                            "step": global_step,
+                            "metric": "macro_average.decode_window_backbone_consistency_average_accepted_length",
+                            "recent_values": backbone_acceptance_history[
+                                -(config.early_stop_patience_evals + 1) :
+                            ],
+                            "min_delta": config.early_stop_min_delta,
+                        }
+                    ),
+                    flush=True,
+                )
 
         if global_step % config.save_steps == 0:
             checkpoint = save_checkpoint(
@@ -230,6 +295,9 @@ def main() -> None:
             )
             prune_checkpoints(output_dir, config.save_total_limit)
             print(f"Saved {checkpoint}", flush=True)
+
+        if stop_requested:
+            break
 
     if global_step % config.save_steps:
         save_checkpoint(output_dir, global_step, model, optimizer, scheduler, config)

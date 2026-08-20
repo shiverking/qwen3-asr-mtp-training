@@ -96,3 +96,21 @@ def test_branch_cross_entropy_returns_predictions_and_per_token_losses():
     assert result.correct.tolist() == [[True, False]]
     assert result.token_losses[0, 0] > 0
     assert result.token_losses[0, 1] == 0
+
+
+def test_sample_mean_gives_each_sample_equal_weight():
+    from mtp_training.objectives import branch_cross_entropy
+
+    hidden = torch.tensor(
+        [
+            [[0.0, 5.0], [0.0, 5.0]],
+            [[5.0, 0.0], [0.0, 5.0]],
+        ]
+    )
+    targets = torch.tensor([[0, 0], [0, 1]])
+    valid = torch.tensor([[True, True], [True, False]])
+    token_mean = branch_cross_entropy(hidden, torch.nn.Identity(), targets, valid)
+    sample_mean = branch_cross_entropy(
+        hidden, torch.nn.Identity(), targets, valid, reduction="sample_mean"
+    )
+    assert sample_mean.loss < token_mean.loss

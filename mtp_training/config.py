@@ -38,6 +38,12 @@ class TrainConfig:
     sampler_mode: str = "duration"
     language_temperature: float = 0.5
     branch_position_mode: str = "base"
+    loss_reduction: str = "token_mean"
+    reference_eval_samples: int = 0
+    reference_eval_max_new_tokens: int = 64
+    early_stop_after_step: int = 0
+    early_stop_patience_evals: int = 3
+    early_stop_min_delta: float = 0.03
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TrainConfig":
@@ -58,6 +64,18 @@ class TrainConfig:
             raise ValueError("language_temperature must be between 0 and 1")
         if config.branch_position_mode not in ("base", "shifted"):
             raise ValueError("branch_position_mode must be base or shifted")
+        if config.loss_reduction not in ("token_mean", "sample_mean"):
+            raise ValueError("loss_reduction must be token_mean or sample_mean")
+        if config.reference_eval_samples < 0:
+            raise ValueError("reference_eval_samples must be >= 0")
+        if config.reference_eval_max_new_tokens < 1:
+            raise ValueError("reference_eval_max_new_tokens must be >= 1")
+        if config.early_stop_after_step < 0:
+            raise ValueError("early_stop_after_step must be >= 0")
+        if config.early_stop_patience_evals < 1:
+            raise ValueError("early_stop_patience_evals must be >= 1")
+        if config.early_stop_min_delta < 0:
+            raise ValueError("early_stop_min_delta must be >= 0")
         return config
 
     def resolve_manifest(self, value: str) -> str:

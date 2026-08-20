@@ -103,16 +103,20 @@ class Qwen3ASRMTPModel(nn.Module):
         depth: int = 3,
         alpha: float = 0.9,
         branch_position_mode: str = "base",
+        loss_reduction: str = "token_mean",
     ):
         super().__init__()
         if depth < 1:
             raise ValueError("depth must be >= 1")
         if branch_position_mode not in ("base", "shifted"):
             raise ValueError("branch_position_mode must be base or shifted")
+        if loss_reduction not in ("token_mean", "sample_mean"):
+            raise ValueError("loss_reduction must be token_mean or sample_mean")
         self.asr_model = asr_model
         self.depth = depth
         self.alpha = alpha
         self.branch_position_mode = branch_position_mode
+        self.loss_reduction = loss_reduction
         thinker = self.thinker
         text_model = thinker.model
         self.branches = nn.ModuleList(
@@ -177,7 +181,11 @@ class Qwen3ASRMTPModel(nn.Module):
         main_hidden, position_ids = self._backbone_hidden(batch)
         main_targets, main_valid = shifted_targets(input_ids, loss_mask, 1)
         main_result = branch_cross_entropy(
-            main_hidden[:, :-1], self.thinker.lm_head, main_targets, main_valid
+            main_hidden[:, :-1],
+            self.thinker.lm_head,
+            main_targets,
+            main_valid,
+            self.loss_reduction,
         )
 
         branch_results: list[BranchResult] = []
@@ -201,6 +209,7 @@ class Qwen3ASRMTPModel(nn.Module):
                     self.thinker.lm_head,
                     targets,
                     valid,
+                    self.loss_reduction,
                 )
             )
 
