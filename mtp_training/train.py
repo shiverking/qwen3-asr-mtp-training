@@ -91,7 +91,7 @@ def build_loader(dataset, processor, config, train: bool):
         dataset,
         batch_size=config.batch_size,
         seed=config.seed,
-        drop_last=train,
+        drop_last=False,
         **sampler_kwargs,
     )
     return DataLoader(
@@ -149,12 +149,13 @@ def summarize_training_data(dataset, loader, config) -> dict:
             for language, seconds in sorted(seconds_by_language.items())
         },
         "batches_per_epoch": batches_per_epoch,
-        "samples_per_full_epoch": batches_per_epoch * config.batch_size,
+        "samples_per_full_epoch": len(dataset),
         "planned_optimizer_steps": config.max_steps,
-        "planned_sample_exposures": (
+        "planned_sample_exposures_upper_bound": (
             planned_batches * config.batch_size
         ),
         "planned_epochs": planned_batches / max(batches_per_epoch, 1),
+        "covers_full_manifest": planned_batches >= batches_per_epoch,
     }
 
 
@@ -231,7 +232,8 @@ def main() -> None:
     print(
         f"data samples={data_summary['samples']:,} hours={data_summary['hours']:.2f} "
         f"batches/epoch={data_summary['batches_per_epoch']:,} "
-        f"planned_epochs={data_summary['planned_epochs']:.3f}",
+        f"planned_epochs={data_summary['planned_epochs']:.3f} "
+        f"covers_full_manifest={str(data_summary['covers_full_manifest']).lower()}",
         flush=True,
     )
     print(f"data languages {language_hours}", flush=True)
