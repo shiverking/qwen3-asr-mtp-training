@@ -62,9 +62,15 @@ class DurationBucketBatchSampler(Sampler[list[int]]):
         self.bucket_size = batch_size * bucket_multiplier
         self.drop_last = drop_last
         self.epoch = 0
+        self.start_batch = 0
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
+
+    def set_start_batch(self, start_batch: int) -> None:
+        if start_batch < 0:
+            raise ValueError("start_batch must be >= 0")
+        self.start_batch = start_batch
 
     def __len__(self) -> int:
         size = len(self.dataset) // self.batch_size
@@ -85,7 +91,9 @@ class DurationBucketBatchSampler(Sampler[list[int]]):
                 if len(batch) == self.batch_size or not self.drop_last:
                     batches.append(batch)
         rng.shuffle(batches)
-        yield from batches
+        start_batch = self.start_batch
+        self.start_batch = 0
+        yield from batches[start_batch:]
 
 
 class LanguageTemperatureBatchSampler(Sampler[list[int]]):

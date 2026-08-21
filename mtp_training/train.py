@@ -46,32 +46,19 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def build_scheduler(optimizer, config: TrainConfig):
+def build_scheduler(optimizer, config: TrainConfig, schedule_steps: int):
     minimum_ratio = config.min_learning_rate / config.learning_rate
 
     def schedule(step: int) -> float:
         if step < config.warmup_steps:
             return max(step, 1) / max(config.warmup_steps, 1)
-        progress = (step - config.warmup_steps) / max(config.max_steps - config.warmup_steps, 1)
+        progress = (step - config.warmup_steps) / max(
+            schedule_steps - config.warmup_steps, 1
+        )
         cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         return minimum_ratio + (1.0 - minimum_ratio) * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
-
-
-def should_stop_for_plateau(
-    history: list[float], global_step: int, config: TrainConfig
-) -> bool:
-    if not config.early_stop_after_step or global_step < config.early_stop_after_step:
-        return False
-    required = config.early_stop_patience_evals + 1
-    if len(history) < required:
-        return False
-    recent = history[-required:]
-    return all(
-        current - previous < config.early_stop_min_delta
-        for previous, current in zip(recent, recent[1:])
-    )
 
 
 def build_loader(dataset, processor, config, train: bool):
@@ -130,7 +117,7 @@ def concise_eval(step: int, metrics: dict, reference_metrics: dict | None) -> st
     )
 
 
-def summarize_training_data(dataset, loader, config) -> dict:
+def summarize_training_data(dataset, loader, config, target_steps: int) -> dict:
     samples_by_language: Counter[str] = Counter()
     seconds_by_language: Counter[str] = Counter()
     for row in dataset.rows:
@@ -138,7 +125,7 @@ def summarize_training_data(dataset, loader, config) -> dict:
         samples_by_language[language] += 1
         seconds_by_language[language] += float(row["duration_s"])
     batches_per_epoch = len(loader)
-    planned_batches = config.max_steps * config.gradient_accumulation_steps
+    planned_batches = target_steps * config.gradient_accumulation_steps
     return {
         "manifest": str(dataset.manifest_path),
         "samples": len(dataset),
@@ -150,7 +137,7 @@ def summarize_training_data(dataset, loader, config) -> dict:
         },
         "batches_per_epoch": batches_per_epoch,
         "samples_per_full_epoch": len(dataset),
-        "planned_optimizer_steps": config.max_steps,
+        "planned_optimizer_steps": target_steps,
         "planned_sample_exposures_upper_bound": (
             planned_batches * config.batch_size
         ),
@@ -220,7 +207,22 @@ def main() -> None:
     )
     train_loader = build_loader(train_dataset, wrapper.processor, config, train=True)
     eval_loader = build_loader(eval_dataset, wrapper.processor, config, train=False)
-    data_summary = summarize_training_data(train_dataset, train_loader, config)
+    target_steps = (
+        math.ceil(
+            len(train_loader)
+            * config.num_train_epochs
+            / config.gradient_accumulation_steps
+        )
+        if config.num_train_epochs
+        else config.max_steps
+    )
+    if config.initial_step >= target_steps:
+        raise ValueError(
+            f"initial_step {config.initial_step} must be below target step {target_steps}"
+        )
+    data_summary = summarize_training_data(
+        train_dataset, train_loader, config, target_steps
+    )
     startup_audit["training_data"] = data_summary
     (output_dir / "startup_audit.json").write_text(
         json.dumps(startup_audit, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -246,12 +248,18 @@ def main() -> None:
         eps=1.0e-8,
         weight_decay=config.weight_decay,
     )
-    scheduler = build_scheduler(optimizer, config)
-    global_step = 0
+    global_step = config.initial_step
     if config.resume_from:
+        scheduler = build_scheduler(optimizer, config, target_steps)
         global_step = resume_training(model, optimizer, scheduler, config.resume_from)
     elif config.init_mtp_from:
         load_trainable_weights(model, config.init_mtp_from, allow_missing_asr=True)
+        scheduler = build_scheduler(
+            optimizer, config, max(target_steps - global_step, 1)
+        )
+    else:
+        scheduler = build_scheduler(optimizer, config, target_steps)
+    starting_step = global_step
 
     optimizer.zero_grad(set_to_none=True)
     model.train()
@@ -259,22 +267,28 @@ def main() -> None:
     running_started = time.perf_counter()
     exposure_samples: Counter[str] = Counter()
     exposure_tokens: Counter[str] = Counter()
+    consumed_batches = global_step * config.gradient_accumulation_steps
+    data_epoch, start_batch = divmod(consumed_batches, len(train_loader))
+    train_loader.batch_sampler.set_epoch(data_epoch)
+    if start_batch:
+        if not hasattr(train_loader.batch_sampler, "set_start_batch"):
+            raise ValueError("Selected sampler cannot continue from initial_step")
+        train_loader.batch_sampler.set_start_batch(start_batch)
     data_iterator = iter(train_loader)
-    backbone_acceptance_history: list[float] = []
-    stop_requested = False
     progress = tqdm(
-        total=config.max_steps,
+        total=target_steps,
         initial=global_step,
         desc=f"MTP-{config.mtp_depth} stage-{config.stage}",
         unit="step",
         dynamic_ncols=True,
     )
-    while global_step < config.max_steps:
+    while global_step < target_steps:
         for _ in range(config.gradient_accumulation_steps):
             try:
                 batch = next(data_iterator)
             except StopIteration:
-                train_loader.batch_sampler.set_epoch(global_step + 1)
+                data_epoch += 1
+                train_loader.batch_sampler.set_epoch(data_epoch)
                 data_iterator = iter(train_loader)
                 batch = next(data_iterator)
             languages = batch.pop("languages")
@@ -296,7 +310,8 @@ def main() -> None:
         global_step += 1
         progress.update(1)
 
-        if global_step % config.log_steps == 0:
+        run_step = global_step - starting_step
+        if run_step % config.log_steps == 0:
             elapsed = time.perf_counter() - running_started
             payload = {
                 "step": global_step,
@@ -316,18 +331,13 @@ def main() -> None:
             running_loss = 0.0
             running_started = time.perf_counter()
 
-        if global_step % config.eval_steps == 0:
+        if run_step % config.eval_steps == 0:
             metrics = evaluate(model, eval_loader, config.stage, device, config.eval_batches)
-            backbone_acceptance_history.append(
-                metrics["macro_average"][
-                    "decode_window_backbone_consistency_average_accepted_length"
-                ]
-            )
             reference_metrics = None
             if (
                 config.reference_eval_samples
                 and config.reference_eval_steps
-                and global_step % config.reference_eval_steps == 0
+                and run_step % config.reference_eval_steps == 0
             ):
                 from .reference_verifier import evaluate_speculative_reference
 
@@ -362,27 +372,17 @@ def main() -> None:
             }
             append_metric(metrics_path, eval_payload)
             progress.write(concise_eval(global_step, metrics, reference_metrics))
-            stop_requested = should_stop_for_plateau(
-                backbone_acceptance_history, global_step, config
-            )
-            if stop_requested:
-                progress.write(
-                    f"early stop step={global_step} bb_recent="
-                    f"{backbone_acceptance_history[-(config.early_stop_patience_evals + 1):]}"
-                )
 
-        if global_step % config.save_steps == 0:
+        if run_step % config.save_steps == 0:
             checkpoint = save_checkpoint(
                 output_dir, global_step, model, optimizer, scheduler, config
             )
             prune_checkpoints(output_dir, config.save_total_limit)
             progress.write(f"saved {checkpoint}")
 
-        if stop_requested:
-            break
     progress.close()
 
-    if global_step % config.save_steps:
+    if (global_step - starting_step) % config.save_steps:
         save_checkpoint(output_dir, global_step, model, optimizer, scheduler, config)
 
 

@@ -18,6 +18,8 @@ class TrainConfig:
     alpha: float = 0.9
     seed: int = 20260819
     max_steps: int = 2000
+    num_train_epochs: int = 0
+    initial_step: int = 0
     batch_size: int = 8
     gradient_accumulation_steps: int = 4
     learning_rate: float = 2.0e-4
@@ -42,9 +44,6 @@ class TrainConfig:
     reference_eval_samples: int = 0
     reference_eval_max_new_tokens: int = 64
     reference_eval_steps: int = 0
-    early_stop_after_step: int = 0
-    early_stop_patience_evals: int = 3
-    early_stop_min_delta: float = 0.03
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TrainConfig":
@@ -73,12 +72,14 @@ class TrainConfig:
             raise ValueError("reference_eval_max_new_tokens must be >= 1")
         if config.reference_eval_steps < 0:
             raise ValueError("reference_eval_steps must be >= 0")
-        if config.early_stop_after_step < 0:
-            raise ValueError("early_stop_after_step must be >= 0")
-        if config.early_stop_patience_evals < 1:
-            raise ValueError("early_stop_patience_evals must be >= 1")
-        if config.early_stop_min_delta < 0:
-            raise ValueError("early_stop_min_delta must be >= 0")
+        if config.num_train_epochs < 0:
+            raise ValueError("num_train_epochs must be >= 0")
+        if config.initial_step < 0:
+            raise ValueError("initial_step must be >= 0")
+        if config.num_train_epochs == 0 and config.max_steps < 1:
+            raise ValueError("max_steps must be >= 1 when num_train_epochs is 0")
+        if config.initial_step and not config.init_mtp_from:
+            raise ValueError("initial_step requires init_mtp_from")
         return config
 
     def resolve_manifest(self, value: str) -> str:
