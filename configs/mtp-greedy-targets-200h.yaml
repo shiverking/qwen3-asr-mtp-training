@@ -1,0 +1,8 @@
+model_path: /root/autodl-tmp/models/Qwen3-ASR-1.7B
+dataset_root: /root/autodl-tmp/qwen3_asr_mtp_200h
+input_manifest: manifests/train.jsonl
+output_dir: /root/autodl-tmp/outputs/mtp-greedy-targets-200h
+model_revision: local-qwen3-asr-1.7b
+batch_size: 8
+max_new_tokens: 512
+attn_implementation: sdpa

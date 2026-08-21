@@ -65,6 +65,11 @@ def build_loader(dataset, processor, config, train: bool):
     collator = MTPDataCollator(
         processor=processor,
         include_eos_in_loss=config.include_eos_in_loss,
+        target_text_field=(
+            config.train_target_text_field
+            if train
+            else config.eval_target_text_field
+        ),
     )
     sampler_class = (
         LanguageTemperatureBatchSampler

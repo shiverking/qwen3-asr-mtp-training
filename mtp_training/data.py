@@ -171,6 +171,7 @@ class MTPDataCollator:
     processor: Any
     sampling_rate: int = 16000
     include_eos_in_loss: bool = False
+    target_text_field: str = "text"
 
     def _load_audio(self, path: str):
         audio, sampling_rate = sf.read(path, dtype="float32", always_2d=False)
@@ -204,9 +205,17 @@ class MTPDataCollator:
             for prefix, language in zip(generation_prefixes, language_names)
         ]
         eos = self.processor.tokenizer.eos_token or ""
+        targets = []
+        for row in rows:
+            target = row.get(self.target_text_field)
+            if not isinstance(target, str) or not target.strip():
+                raise ValueError(
+                    f"Missing non-empty {self.target_text_field!r} for {row['id']}"
+                )
+            targets.append(target)
         full_texts = [
-            prefix + row["text"] + eos
-            for prefix, row in zip(transcript_prefixes, rows)
+            prefix + target + eos
+            for prefix, target in zip(transcript_prefixes, targets)
         ]
 
         full_inputs = self.processor(

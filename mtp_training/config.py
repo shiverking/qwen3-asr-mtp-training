@@ -44,6 +44,8 @@ class TrainConfig:
     reference_eval_samples: int = 0
     reference_eval_max_new_tokens: int = 64
     reference_eval_steps: int = 0
+    train_target_text_field: str = "text"
+    eval_target_text_field: str = "text"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TrainConfig":
@@ -80,6 +82,10 @@ class TrainConfig:
             raise ValueError("max_steps must be >= 1 when num_train_epochs is 0")
         if config.initial_step and not config.init_mtp_from:
             raise ValueError("initial_step requires init_mtp_from")
+        if not config.train_target_text_field:
+            raise ValueError("train_target_text_field must not be empty")
+        if not config.eval_target_text_field:
+            raise ValueError("eval_target_text_field must not be empty")
         return config
 
     def resolve_manifest(self, value: str) -> str:
