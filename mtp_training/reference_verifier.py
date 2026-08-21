@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Any
 
 import torch
+from tqdm.auto import tqdm
 
 
 def stratified_indices(dataset, total: int, seed: int) -> list[int]:
@@ -144,15 +145,26 @@ def evaluate_speculative_reference(
     collator,
     device,
     eos_token_id: int | None,
-    samples: int,
+    samples: int | None,
     max_new_tokens: int,
     seed: int,
+    show_progress: bool = False,
 ) -> dict[str, Any]:
     was_training = model.training
     model.eval()
     results = []
     autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    for index in stratified_indices(dataset, samples, seed):
+    indices = (
+        list(range(len(dataset)))
+        if samples is None
+        else stratified_indices(dataset, samples, seed)
+    )
+    iterator = (
+        tqdm(indices, desc="reference verifier", unit="sample")
+        if show_progress
+        else indices
+    )
+    for index in iterator:
         row = dataset[index]
         prefix = prefix_batch(collator, row, device)
         with autocast:
