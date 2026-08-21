@@ -1,0 +1,26 @@
+model_path: /root/autodl-tmp/models/Qwen3-ASR-1.7B
+dataset_root: /root/autodl-tmp/qwen3_asr_mtp_200h
+output_dir: /root/autodl-tmp/outputs/english-target-audit
+language: en
+seed: 20260819
+batch_size: 8
+attn_implementation: sdpa
+max_new_tokens: 512
+max_normalized_wer_for_export: 0.2
+groups:
+  - name: librispeech-train-audit
+    manifest: manifests/train.jsonl
+    source: openslr/librispeech
+    samples: 50
+    export_ab_manifests: false
+  - name: fleurs-train-ab
+    manifest: manifests/train.jsonl
+    source: google/fleurs
+    samples: 1000
+    export_ab_manifests: true
+  - name: fleurs-dev-audit
+    manifest: manifests/dev.jsonl
+    source: google/fleurs
+    samples: 250
+    export_ab_manifests: false
+    export_reference_manifest: true
