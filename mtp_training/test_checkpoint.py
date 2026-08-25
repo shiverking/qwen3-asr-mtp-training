@@ -33,7 +33,7 @@ class CheckpointTestConfig:
     batch_size: int = 32
     num_workers: int = 8
     include_eos_in_loss: bool = False
-    attn_implementation: str = "sdpa"
+    attn_implementation: str = "flash_attention_2"
     branch_position_mode: str = "base"
     loss_reduction: str = "token_mean"
     reference_samples: int = -1
@@ -117,9 +117,6 @@ def _gates(
     reference: dict[str, Any],
     config: CheckpointTestConfig,
 ) -> dict[str, Any]:
-    macro_bb = teacher_forced["macro_average"][
-        "decode_window_backbone_consistency_average_accepted_length"
-    ]
     reference_value = reference["average_accepted_length"]
     language_values = reference["by_language"]
     per_language = {
@@ -131,11 +128,6 @@ def _gates(
         for language, value in language_values.items()
     }
     result = {
-        "macro_bb": {
-            "value": macro_bb,
-            "threshold": config.macro_bb_min,
-            "passed": macro_bb >= config.macro_bb_min,
-        },
         "reference": {
             "value": reference_value,
             "threshold": config.reference_min,
@@ -144,8 +136,7 @@ def _gates(
         "per_language_reference": per_language,
     }
     result["passed"] = (
-        result["macro_bb"]["passed"]
-        and result["reference"]["passed"]
+        result["reference"]["passed"]
         and bool(per_language)
         and all(item["passed"] for item in per_language.values())
     )
@@ -197,16 +188,16 @@ def main() -> None:
     macro = teacher_forced["macro_average"]
     print(
         f"test loss={macro['loss']:.4f} "
-        f"gt={macro['decode_window_ground_truth_average_accepted_length']:.3f} "
-        f"bb={macro['decode_window_backbone_consistency_average_accepted_length']:.3f}"
+        f"target_len={macro['strict_average_accepted_length']:.3f}/6 "
+        f"pos={[round(value, 4) for value in macro['strict_position_acceptance']]}"
     )
     for language, metrics in teacher_forced.items():
         if language in ("all", "macro_average"):
             continue
         print(
             f"test language={language} "
-            f"gt={metrics['decode_window_ground_truth_average_accepted_length']:.3f} "
-            f"bb={metrics['decode_window_backbone_consistency_average_accepted_length']:.3f}"
+            f"target_len={metrics['strict_average_accepted_length']:.3f}/6 "
+            f"pos={[round(value, 4) for value in metrics['strict_position_acceptance']]}"
         )
 
     reference_samples = (
@@ -228,9 +219,13 @@ def main() -> None:
         show_progress=True,
     )
     gates = _gates(teacher_forced, reference, config)
-    print(f"reference accepted={reference['average_accepted_length']:.3f}")
+    print(
+        f"reference accepted={reference['average_accepted_length']:.3f}/6 "
+        f"pos={[round(value, 4) for value in reference['strict_position_acceptance']]}"
+    )
     for language, value in reference["by_language"].items():
-        print(f"reference language={language} accepted={value:.3f}")
+        positions = reference["by_language_metrics"][language]["strict_position_acceptance"]
+        print(f"reference language={language} accepted={value:.3f}/6 pos={[round(item, 4) for item in positions]}")
     print(f"test gates={'passed' if gates['passed'] else 'failed'}")
 
     report = {

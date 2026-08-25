@@ -10,7 +10,8 @@ from tqdm.auto import tqdm
 
 def stratified_indices(dataset, total: int, seed: int) -> list[int]:
     grouped = defaultdict(list)
-    for index, row in enumerate(dataset.rows):
+    for index in range(len(dataset)):
+        row = dataset[index]
         grouped[row["language"]].append(index)
     rng = random.Random(seed)
     languages = sorted(grouped)
@@ -175,16 +176,34 @@ def evaluate_speculative_reference(
         results.append(result)
     by_language = defaultdict(list)
     for result in results:
-        by_language[result["language"]].append(result["average_accepted_length"])
+        by_language[result["language"]].extend(result["accepted_lengths"])
+    def acceptance(values: list[int]) -> dict[str, Any]:
+        denominator = max(len(values), 1)
+        strict = [sum(value >= position + 2 for value in values) / denominator for position in range(model.depth)]
+        counts = [sum(value >= position + 2 for value in values) for position in range(model.depth)]
+        conditional = [
+            counts[position] / max(denominator if position == 0 else counts[position - 1], 1)
+            for position in range(model.depth)
+        ]
+        return {
+            "average_accepted_length": 1.0 + sum(strict),
+            "strict_position_acceptance": strict,
+            "conditional_position_acceptance": conditional,
+            "verification_iterations": len(values),
+        }
+    all_lengths = [length for result in results for length in result["accepted_lengths"]]
+    overall_metrics = acceptance(all_lengths)
+    language_metrics = {
+        key: acceptance(values) for key, values in sorted(by_language.items())
+    }
     summary = {
         "samples": len(results),
-        "average_accepted_length": sum(
-            value for values in by_language.values() for value in values
-        )
-        / max(len(results), 1),
+        **overall_metrics,
         "by_language": {
-            key: sum(values) / len(values) for key, values in sorted(by_language.items())
+            key: value["average_accepted_length"]
+            for key, value in language_metrics.items()
         },
+        "by_language_metrics": language_metrics,
         "results": results,
     }
     model.train(was_training)

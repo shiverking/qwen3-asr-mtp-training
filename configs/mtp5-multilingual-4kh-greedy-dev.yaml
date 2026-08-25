@@ -1,0 +1,10 @@
+model_path: /root/autodl-tmp/models/Qwen3-ASR-1.7B
+dataset_root: /root/autodl-tmp/audio_dataset/qwen3_asr_mtp_multilingual
+input_manifest: manifests/eval/dev.jsonl
+output_dir: /root/autodl-tmp/audio_dataset/qwen3_asr_mtp_multilingual/manifests/greedy
+output_name: dev.jsonl
+model_revision: Qwen3-ASR-1.7B-local
+batch_size: 64
+max_new_tokens: 512
+attn_implementation: flash_attention_2
+log_every_batches: 20

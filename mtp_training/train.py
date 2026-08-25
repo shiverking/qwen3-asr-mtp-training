@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -24,7 +25,9 @@ from .checkpointing import (
 from .config import TrainConfig
 from .data import (
     DurationBucketBatchSampler,
+    IndexedManifestDataset,
     LanguageTemperatureBatchSampler,
+    MixedLanguageSourceTemperatureBatchSampler,
     MTPDataCollator,
     ManifestDataset,
 )
@@ -71,14 +74,20 @@ def build_loader(dataset, processor, config, train: bool):
             else config.eval_target_text_field
         ),
     )
-    sampler_class = (
-        LanguageTemperatureBatchSampler
-        if train and config.sampler_mode == "language_temperature"
-        else DurationBucketBatchSampler
-    )
+    if train and config.sampler_mode == "mixed_language_source_temperature":
+        sampler_class = MixedLanguageSourceTemperatureBatchSampler
+    elif train and config.sampler_mode == "language_temperature":
+        sampler_class = LanguageTemperatureBatchSampler
+    else:
+        sampler_class = DurationBucketBatchSampler
     sampler_kwargs = {}
     if sampler_class is LanguageTemperatureBatchSampler:
         sampler_kwargs["temperature"] = config.language_temperature
+    elif sampler_class is MixedLanguageSourceTemperatureBatchSampler:
+        sampler_kwargs.update(
+            language_temperature=config.language_temperature,
+            source_temperature=config.source_temperature,
+        )
     sampler = sampler_class(
         dataset,
         batch_size=config.batch_size,
@@ -102,27 +111,80 @@ def append_metric(path: Path, payload: dict) -> None:
         stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def concise_eval(step: int, metrics: dict, reference_metrics: dict | None) -> str:
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_dataset_gate(config: TrainConfig) -> None:
+    root = Path(config.dataset_root)
+    temporary_files = list((root / "manifests").rglob("*.tmp"))
+    if temporary_files:
+        raise RuntimeError(f"Dataset contains unfinished .tmp files: {temporary_files[:5]}")
+    if config.use_indexed_train_dataset:
+        required_languages = {"en", "es", "pt-BR", "pt-PT"}
+        for split in ("dev", "test"):
+            path = root / "manifests" / "eval" / f"{split}.jsonl"
+            if not path.is_file():
+                raise FileNotFoundError(f"Missing multilingual {split} manifest: {path}")
+            languages = set()
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    if line.strip():
+                        languages.add(json.loads(line)["language"])
+            missing = required_languages - languages
+            if missing:
+                raise RuntimeError(f"{split} manifest is missing languages: {sorted(missing)}")
+
+
+def concise_eval(epoch: float, step: int, metrics: dict) -> str:
     macro = metrics["macro_average"]
-    language_bb = ", ".join(
-        f"{language}={values['decode_window_backbone_consistency_average_accepted_length']:.2f}"
+    languages = ", ".join(
+        f"{language}={values['strict_average_accepted_length']:.2f}"
         for language, values in metrics.items()
         if language not in ("all", "macro_average")
     )
-    reference = (
-        f" ref={reference_metrics['average_accepted_length']:.2f}"
-        if reference_metrics is not None
-        else ""
+    positions = ",".join(f"{value:.3f}" for value in macro["strict_position_acceptance"])
+    return (
+        f"eval epoch={epoch:.2f} step={step} loss={macro['loss']:.4f} "
+        f"greedy_len={macro['strict_average_accepted_length']:.3f}/6 "
+        f"pos=[{positions}] | {languages}"
+    )
+
+
+def concise_verify(epoch: float, metrics: dict) -> str:
+    positions = ",".join(f"{value:.3f}" for value in metrics["strict_position_acceptance"])
+    languages = ", ".join(
+        f"{key}={value:.2f}" for key, value in metrics["by_language"].items()
     )
     return (
-        f"eval step={step} loss={macro['loss']:.4f} "
-        f"gt={macro['decode_window_ground_truth_average_accepted_length']:.3f} "
-        f"bb={macro['decode_window_backbone_consistency_average_accepted_length']:.3f}"
-        f"{reference} | {language_bb}"
+        f"verify epoch={epoch:.2f} len={metrics['average_accepted_length']:.3f}/6 "
+        f"pos=[{positions}] | {languages}"
     )
 
 
 def summarize_training_data(dataset, loader, config, target_steps: int) -> dict:
+    if isinstance(dataset, IndexedManifestDataset):
+        metadata = dataset.metadata
+        batches_per_epoch = len(loader)
+        planned_batches = target_steps * config.gradient_accumulation_steps
+        return {
+            "manifest": str(dataset.manifest_path),
+            "manifest_sha256": dataset.manifest_sha256,
+            "samples": len(dataset),
+            "hours": metadata["hours"],
+            "samples_by_language": metadata["samples_by_language"],
+            "hours_by_language": metadata["hours_by_language"],
+            "batches_per_epoch": batches_per_epoch,
+            "samples_per_full_epoch": len(dataset),
+            "planned_optimizer_steps": target_steps,
+            "planned_sample_exposures_upper_bound": planned_batches * config.batch_size,
+            "planned_epochs": planned_batches / max(batches_per_epoch, 1),
+            "covers_full_manifest": planned_batches >= batches_per_epoch,
+        }
     samples_by_language: Counter[str] = Counter()
     seconds_by_language: Counter[str] = Counter()
     for row in dataset.rows:
@@ -166,6 +228,7 @@ def main() -> None:
     (output_dir / "resolved_config.json").write_text(
         json.dumps(config.__dict__, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    validate_dataset_gate(config)
 
     wrapper = Qwen3ASRModel.from_pretrained(
         config.model_path,
@@ -204,9 +267,20 @@ def main() -> None:
     device = torch.device("cuda:0")
     model.to(device)
 
-    train_dataset = ManifestDataset(
+    train_dataset_class = (
+        IndexedManifestDataset if config.use_indexed_train_dataset else ManifestDataset
+    )
+    train_dataset = train_dataset_class(
         config.resolve_manifest(config.train_manifest), config.dataset_root
     )
+    if isinstance(train_dataset, IndexedManifestDataset):
+        expected_languages = {"en", "es", "pt-BR", "pt-PT"}
+        actual_languages = set(train_dataset.languages)
+        if actual_languages != expected_languages:
+            raise RuntimeError(
+                f"Indexed train manifest languages {sorted(actual_languages)} do not "
+                f"match required {sorted(expected_languages)}"
+            )
     eval_dataset = ManifestDataset(
         config.resolve_manifest(config.eval_manifest), config.dataset_root
     )
@@ -221,6 +295,26 @@ def main() -> None:
         if config.num_train_epochs
         else config.max_steps
     )
+    optimizer_steps_per_epoch = math.ceil(
+        len(train_loader) / config.gradient_accumulation_steps
+    )
+    eval_interval = (
+        max(1, round(optimizer_steps_per_epoch * config.eval_every_epochs))
+        if config.eval_every_epochs
+        else config.eval_steps
+    )
+    verify_interval = (
+        max(1, round(optimizer_steps_per_epoch * config.verify_every_epochs))
+        if config.verify_every_epochs
+        else config.reference_eval_steps
+    )
+    save_interval = (
+        max(1, round(optimizer_steps_per_epoch * config.save_every_epochs))
+        if config.save_every_epochs
+        else config.save_steps
+    )
+    if config.warmup_ratio:
+        config.warmup_steps = max(1, round(target_steps * config.warmup_ratio))
     if config.initial_step >= target_steps:
         raise ValueError(
             f"initial_step {config.initial_step} must be below target step {target_steps}"
@@ -265,6 +359,25 @@ def main() -> None:
     else:
         scheduler = build_scheduler(optimizer, config, target_steps)
     starting_step = global_step
+    runtime_metadata = {
+        "train_manifest_sha256": getattr(train_dataset, "manifest_sha256", ""),
+        "dev_manifest_sha256": file_sha256(eval_dataset.manifest_path),
+        "completed_epoch": global_step / optimizer_steps_per_epoch,
+        "steps_per_epoch": optimizer_steps_per_epoch,
+        "greedy_target_model_revision": config.greedy_target_model_revision,
+        "sampler": {
+            "mode": config.sampler_mode,
+            "language_temperature": config.language_temperature,
+            "source_temperature": config.source_temperature,
+        },
+    }
+    if config.resume_from:
+        checkpoint_metadata = json.loads(
+            (Path(config.resume_from) / "mtp_config.json").read_text(encoding="utf-8")
+        ).get("runtime_metadata", {})
+        expected_hash = checkpoint_metadata.get("train_manifest_sha256")
+        if expected_hash and expected_hash != runtime_metadata["train_manifest_sha256"]:
+            raise RuntimeError("Training manifest hash differs from checkpoint")
 
     optimizer.zero_grad(set_to_none=True)
     model.train()
@@ -336,31 +449,9 @@ def main() -> None:
             running_loss = 0.0
             running_started = time.perf_counter()
 
-        if run_step % config.eval_steps == 0:
+        if run_step % eval_interval == 0:
             metrics = evaluate(model, eval_loader, config.stage, device, config.eval_batches)
-            reference_metrics = None
-            if (
-                config.reference_eval_samples
-                and config.reference_eval_steps
-                and run_step % config.reference_eval_steps == 0
-            ):
-                from .reference_verifier import evaluate_speculative_reference
-
-                reference_metrics = evaluate_speculative_reference(
-                    model,
-                    eval_dataset,
-                    eval_loader.collate_fn,
-                    device,
-                    wrapper.processor.tokenizer.eos_token_id,
-                    config.reference_eval_samples,
-                    config.reference_eval_max_new_tokens,
-                    config.seed,
-                )
-                reference_path = output_dir / f"reference-step-{global_step}.json"
-                reference_path.write_text(
-                    json.dumps(reference_metrics, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+            current_epoch = global_step / optimizer_steps_per_epoch
             eval_payload = {
                 "event": "eval",
                 "step": global_step,
@@ -369,26 +460,62 @@ def main() -> None:
                     "transcript_tokens": dict(sorted(exposure_tokens.items())),
                 },
                 "eval": metrics,
-                "reference_eval": (
-                    {key: value for key, value in reference_metrics.items() if key != "results"}
-                    if reference_metrics is not None
-                    else None
-                ),
+                "reference_eval": None,
             }
             append_metric(metrics_path, eval_payload)
-            progress.write(concise_eval(global_step, metrics, reference_metrics))
+            progress.write(concise_eval(current_epoch, global_step, metrics))
 
-        if run_step % config.save_steps == 0:
+        if config.reference_eval_samples and verify_interval and run_step % verify_interval == 0:
+            from .reference_verifier import evaluate_speculative_reference
+
+            current_epoch = global_step / optimizer_steps_per_epoch
+            reference_metrics = evaluate_speculative_reference(
+                model,
+                eval_dataset,
+                eval_loader.collate_fn,
+                device,
+                wrapper.processor.tokenizer.eos_token_id,
+                config.reference_eval_samples,
+                config.reference_eval_max_new_tokens,
+                config.seed,
+            )
+            reference_path = output_dir / f"reference-step-{global_step}.json"
+            reference_path.write_text(
+                json.dumps(reference_metrics, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            append_metric(
+                metrics_path,
+                {
+                    "event": "verify",
+                    "step": global_step,
+                    "epoch": current_epoch,
+                    "reference_eval": {
+                        key: value
+                        for key, value in reference_metrics.items()
+                        if key != "results"
+                    },
+                },
+            )
+            progress.write(concise_verify(current_epoch, reference_metrics))
+
+        if run_step % save_interval == 0:
+            runtime_metadata["completed_epoch"] = global_step / optimizer_steps_per_epoch
             checkpoint = save_checkpoint(
-                output_dir, global_step, model, optimizer, scheduler, config
+                output_dir, global_step, model, optimizer, scheduler, config,
+                runtime_metadata=runtime_metadata,
             )
             prune_checkpoints(output_dir, config.save_total_limit)
             progress.write(f"saved {checkpoint}")
 
     progress.close()
 
-    if (global_step - starting_step) % config.save_steps:
-        save_checkpoint(output_dir, global_step, model, optimizer, scheduler, config)
+    if (global_step - starting_step) % save_interval:
+        runtime_metadata["completed_epoch"] = global_step / optimizer_steps_per_epoch
+        save_checkpoint(
+            output_dir, global_step, model, optimizer, scheduler, config,
+            runtime_metadata=runtime_metadata,
+        )
 
 
 if __name__ == "__main__":

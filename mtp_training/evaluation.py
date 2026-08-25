@@ -38,6 +38,8 @@ def _empty_stats(depth: int) -> dict[str, Any]:
         "decode_gt_positions": 0,
         "decode_bb_accepted": 0.0,
         "decode_bb_positions": 0,
+        "strict_position_accepted": [0] * depth,
+        "strict_position_eligible": [0] * depth,
     }
 
 
@@ -116,6 +118,20 @@ def _update(item: dict[str, Any], output, rows: list[int]) -> None:
     accepted, positions = strict_acceptance(decode_gt_correct, decode_gt_valid)
     item["decode_gt_accepted"] += float(accepted)
     item["decode_gt_positions"] += int(positions)
+    if decode_gt_correct:
+        width = min(value.shape[1] for value in decode_gt_correct)
+        eligible = torch.ones_like(decode_gt_valid[0][:, :width])
+        for valid in decode_gt_valid:
+            eligible &= valid[:, :width]
+        prefix_correct = torch.ones_like(eligible)
+        for branch_index, (correct, valid) in enumerate(
+            zip(decode_gt_correct, decode_gt_valid)
+        ):
+            prefix_correct &= correct[:, :width]
+            item["strict_position_accepted"][branch_index] += int(
+                (eligible & prefix_correct).sum()
+            )
+            item["strict_position_eligible"][branch_index] += int(eligible.sum())
     accepted, positions = strict_acceptance(decode_bb_correct, decode_bb_valid)
     item["decode_bb_accepted"] += float(accepted)
     item["decode_bb_positions"] += int(positions)
@@ -188,6 +204,18 @@ def _finalize(stats: dict[str, Any], weights: list[float], stage: int) -> dict[s
     decode_bb_accepted = stats["decode_bb_accepted"] / max(
         stats["decode_bb_positions"], 1
     )
+    strict_position = _ratios(
+        stats["strict_position_accepted"], stats["strict_position_eligible"]
+    )
+    conditional_position = []
+    for index, accepted in enumerate(stats["strict_position_accepted"]):
+        denominator = (
+            stats["strict_position_eligible"][0]
+            if index == 0
+            else stats["strict_position_accepted"][index - 1]
+        )
+        conditional_position.append(accepted / max(denominator, 1))
+    strict_average = 1.0 + sum(strict_position)
     return {
         "metric_version": METRIC_VERSION,
         "loss": mtp_loss if stage == 1 else main_loss + mtp_loss,
@@ -201,6 +229,10 @@ def _finalize(stats: dict[str, Any], weights: list[float], stage: int) -> dict[s
         "decode_window_ground_truth_branch_valid_tokens": stats["decode_gt_valid"],
         "decode_window_ground_truth_average_accepted_length": decode_gt_accepted,
         "decode_window_ground_truth_eligible_positions": stats["decode_gt_positions"],
+        "strict_position_acceptance": strict_position,
+        "conditional_position_acceptance": conditional_position,
+        "strict_position_verification_counts": stats["strict_position_eligible"],
+        "strict_average_accepted_length": strict_average,
         "decode_window_backbone_consistency_branch_accuracy": decode_bb_accuracy,
         "decode_window_backbone_consistency_branch_valid_tokens": stats["decode_bb_valid"],
         "decode_window_backbone_consistency_average_accepted_length": decode_bb_accepted,
@@ -235,12 +267,15 @@ def _macro_average(items: list[dict[str, Any]]) -> dict[str, Any]:
         "decode_window_backbone_consistency_average_accepted_length",
         "legacy_ground_truth_average_accepted_length",
         "legacy_backbone_consistency_average_accepted_length",
+        "strict_average_accepted_length",
     )
     vector_fields = (
         "branch_losses",
         "training_target_branch_accuracy",
         "decode_window_ground_truth_branch_accuracy",
         "decode_window_backbone_consistency_branch_accuracy",
+        "strict_position_acceptance",
+        "conditional_position_acceptance",
     )
     result: dict[str, Any] = {
         "metric_version": METRIC_VERSION,

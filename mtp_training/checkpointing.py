@@ -27,6 +27,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     config: Any,
+    runtime_metadata: dict[str, Any] | None = None,
 ) -> Path:
     checkpoint = Path(output_dir) / f"checkpoint-{step}"
     checkpoint.mkdir(parents=True, exist_ok=True)
@@ -44,7 +45,9 @@ def save_checkpoint(
         checkpoint / "trainer_state.pt",
     )
     metadata = asdict(config)
-    metadata.update({"global_step": step, "format_version": 1})
+    metadata.update({"global_step": step, "format_version": 2})
+    if runtime_metadata:
+        metadata["runtime_metadata"] = runtime_metadata
     (checkpoint / "mtp_config.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
     )

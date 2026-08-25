@@ -25,13 +25,16 @@ class TrainConfig:
     learning_rate: float = 2.0e-4
     min_learning_rate: float = 1.0e-6
     warmup_steps: int = 100
+    warmup_ratio: float = 0.0
     weight_decay: float = 0.1
     max_grad_norm: float = 1.0
     num_workers: int = 4
     log_steps: int = 10
     eval_steps: int = 250
+    eval_every_epochs: float = 0.0
     eval_batches: int = 100
     save_steps: int = 250
+    save_every_epochs: float = 0.0
     save_total_limit: int = 3
     include_eos_in_loss: bool = False
     attn_implementation: str = "flash_attention_2"
@@ -39,11 +42,15 @@ class TrainConfig:
     init_mtp_from: str = ""
     sampler_mode: str = "duration"
     language_temperature: float = 0.5
+    source_temperature: float = 0.7
+    use_indexed_train_dataset: bool = False
     branch_position_mode: str = "base"
     loss_reduction: str = "token_mean"
     reference_eval_samples: int = 0
     reference_eval_max_new_tokens: int = 64
     reference_eval_steps: int = 0
+    verify_every_epochs: float = 0.0
+    greedy_target_model_revision: str = ""
     train_target_text_field: str = "text"
     eval_target_text_field: str = "text"
 
@@ -60,10 +67,21 @@ class TrainConfig:
             raise ValueError("stage must be 1 or 2")
         if config.stage == 2 and not config.init_mtp_from and not config.resume_from:
             raise ValueError("Stage 2 requires init_mtp_from or resume_from")
-        if config.sampler_mode not in ("duration", "language_temperature"):
-            raise ValueError("sampler_mode must be duration or language_temperature")
+        if config.sampler_mode not in (
+            "duration",
+            "language_temperature",
+            "mixed_language_source_temperature",
+        ):
+            raise ValueError("unsupported sampler_mode")
         if not 0.0 <= config.language_temperature <= 1.0:
             raise ValueError("language_temperature must be between 0 and 1")
+        if not 0.0 <= config.source_temperature <= 1.0:
+            raise ValueError("source_temperature must be between 0 and 1")
+        if not 0.0 <= config.warmup_ratio < 1.0:
+            raise ValueError("warmup_ratio must be in [0, 1)")
+        for name in ("eval_every_epochs", "verify_every_epochs", "save_every_epochs"):
+            if getattr(config, name) < 0:
+                raise ValueError(f"{name} must be >= 0")
         if config.branch_position_mode not in ("base", "shifted"):
             raise ValueError("branch_position_mode must be base or shifted")
         if config.loss_reduction not in ("token_mean", "sample_mean"):

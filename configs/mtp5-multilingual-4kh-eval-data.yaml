@@ -1,0 +1,8 @@
+dataset_root: /root/autodl-tmp/audio_dataset/qwen3_asr_mtp_multilingual
+source_dataset_root: /root/autodl-tmp/qwen3_asr_mtp_200h
+train_manifest: manifests/train.jsonl
+source_dev_manifest: manifests/dev.jsonl
+source_test_manifest: manifests/test.jsonl
+output_dev_manifest: manifests/eval/dev.jsonl
+output_test_manifest: manifests/eval/test.jsonl
+minimum_per_language: 250

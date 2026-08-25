@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-from collections import defaultdict
+import os
+import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -10,10 +12,8 @@ from typing import Any
 import torch
 import yaml
 from qwen_asr import Qwen3ASRModel
-from tqdm.auto import tqdm
 
-from .data import LANGUAGE_NAMES, ManifestDataset
-from .evaluate_backbone_asr import _distance, _units
+from .data import LANGUAGE_NAMES
 
 
 @dataclass
@@ -22,10 +22,12 @@ class GreedyTargetConfig:
     dataset_root: str
     input_manifest: str
     output_dir: str
+    output_name: str = "train_mtp_greedy.jsonl"
     model_revision: str = "local"
-    batch_size: int = 8
+    batch_size: int = 32
     max_new_tokens: int = 512
-    attn_implementation: str = "sdpa"
+    attn_implementation: str = "flash_attention_2"
+    log_every_batches: int = 200
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "GreedyTargetConfig":
@@ -34,109 +36,73 @@ class GreedyTargetConfig:
         unknown = set(values) - known
         if unknown:
             raise ValueError(f"Unknown greedy target config keys: {sorted(unknown)}")
-        config = cls(**values)
-        if config.batch_size < 1:
-            raise ValueError("batch_size must be >= 1")
-        if config.max_new_tokens < 1:
-            raise ValueError("max_new_tokens must be >= 1")
-        return config
+        return cls(**values)
 
     def resolve_input_manifest(self) -> Path:
         path = Path(self.input_manifest)
         return path if path.is_absolute() else Path(self.dataset_root) / path
 
 
-def _load_completed(path: Path) -> dict[str, dict[str, Any]]:
-    completed: dict[str, dict[str, Any]] = {}
-    if not path.is_file():
-        return completed
-    with path.open(encoding="utf-8") as stream:
-        for line_number, line in enumerate(stream, start=1):
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            sample_id = row["id"]
-            if sample_id in completed:
-                raise ValueError(
-                    f"Duplicate id in partial output at line {line_number}: {sample_id}"
-                )
-            completed[sample_id] = row
-    return completed
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def _common_prefix_length(reference: list[int], hypothesis: list[int]) -> int:
-    length = 0
-    for reference_id, hypothesis_id in zip(reference, hypothesis):
-        if reference_id != hypothesis_id:
-            break
-        length += 1
-    return length
-
-
-def _update_stats(
-    stats: dict[str, Any],
-    row: dict[str, Any],
-    hypothesis: str,
-    tokenizer,
-) -> None:
-    reference = row["text"]
-    reference_units = _units(reference, row["language"])
-    hypothesis_units = _units(hypothesis, row["language"])
-    reference_ids = tokenizer.encode(reference, add_special_tokens=False)
-    hypothesis_ids = tokenizer.encode(hypothesis, add_special_tokens=False)
-    prefix = _common_prefix_length(reference_ids, hypothesis_ids)
-    stats["samples"] += 1
-    stats["edits"] += _distance(reference_units, hypothesis_units)
-    stats["reference_units"] += len(reference_units)
-    stats["exact_token_matches"] += int(reference_ids == hypothesis_ids)
-    stats["prefix_ratio_sum"] += prefix / max(len(reference_ids), 1)
-
-
-def _finalize_stats(stats: dict[str, Any]) -> dict[str, Any]:
-    samples = stats["samples"]
-    return {
-        "samples": samples,
-        "normalized_error_rate": stats["edits"]
-        / max(stats["reference_units"], 1),
-        "exact_token_match_rate": stats["exact_token_matches"]
-        / max(samples, 1),
-        "mean_common_token_prefix_ratio": stats["prefix_ratio_sum"]
-        / max(samples, 1),
-    }
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        "Generate resumable Qwen3-ASR greedy targets for an MTP manifest"
-    )
+    parser = argparse.ArgumentParser("Generate resumable streaming greedy targets")
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
     config = GreedyTargetConfig.from_yaml(args.config)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required")
-
+    input_path = config.resolve_input_manifest()
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    partial_path = output_dir / "train_mtp_greedy.partial.jsonl"
-    final_path = output_dir / "train_mtp_greedy.jsonl"
-    rejected_path = output_dir / "train_mtp_greedy_rejected.jsonl"
-    report_path = output_dir / "greedy_target_summary.json"
-
-    dataset = ManifestDataset(
-        str(config.resolve_input_manifest()), config.dataset_root
-    )
-    completed = _load_completed(partial_path)
-    known_ids = {row["id"] for row in dataset.rows}
-    unexpected = sorted(set(completed) - known_ids)
-    if unexpected:
-        raise ValueError(f"Partial output contains unknown ids: {unexpected[:10]}")
-    pending = [row for row in dataset.rows if row["id"] not in completed]
-    print(
-        f"data samples={len(dataset):,} completed={len(completed):,} "
-        f"pending={len(pending):,}",
-        flush=True,
-    )
-
+    final_path = output_dir / config.output_name
+    partial_path = output_dir / f"{config.output_name}.partial"
+    state_path = output_dir / f"{config.output_name}.state.json"
+    rejected_path = output_dir / f"{config.output_name}.rejected.jsonl"
+    if final_path.is_file():
+        print(f"already complete output={final_path}", flush=True)
+        return
+    stat = input_path.stat()
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else None
+    if state is None:
+        state = {
+            "input_manifest": str(input_path.resolve()),
+            "input_size": stat.st_size,
+            "input_mtime_ns": stat.st_mtime_ns,
+            "input_sha256": _sha256(input_path),
+            "input_offset": 0,
+            "output_bytes": 0,
+            "rejected_bytes": 0,
+            "processed": 0,
+            "written": 0,
+            "rejected": 0,
+            "audio_seconds": 0.0,
+            "batches": 0,
+            "elapsed_seconds": 0.0,
+        }
+        _atomic_json(state_path, state)
+    if (state["input_size"], state["input_mtime_ns"], state["input_manifest"]) != (
+        stat.st_size, stat.st_mtime_ns, str(input_path.resolve())
+    ):
+        raise RuntimeError("Input manifest changed since greedy generation started")
+    partial_path.touch(exist_ok=True)
+    with partial_path.open("r+b") as stream:
+        stream.truncate(state["output_bytes"])
+    rejected_path.touch(exist_ok=True)
+    with rejected_path.open("r+b") as stream:
+        stream.truncate(state.get("rejected_bytes", 0))
     model = Qwen3ASRModel.from_pretrained(
         config.model_path,
         dtype=torch.bfloat16,
@@ -146,99 +112,59 @@ def main() -> None:
         max_new_tokens=config.max_new_tokens,
     )
     tokenizer = model.processor.tokenizer
-    rejected: list[dict[str, Any]] = []
-    with partial_path.open("a", encoding="utf-8", newline="\n") as output_stream:
-        progress = tqdm(
-            range(0, len(pending), config.batch_size),
-            desc="greedy targets",
-            unit="batch",
-        )
-        for start in progress:
-            rows = pending[start : start + config.batch_size]
-            outputs = model.transcribe(
-                audio=[
-                    str(dataset.dataset_root / Path(row["audio"]))
-                    for row in rows
-                ],
+    started = time.perf_counter()
+    with input_path.open("rb") as source, partial_path.open("ab") as output, rejected_path.open("ab") as rejected:
+        source.seek(state["input_offset"])
+        while True:
+            rows = []
+            for _ in range(config.batch_size):
+                line = source.readline()
+                if not line:
+                    break
+                if line.strip():
+                    rows.append(json.loads(line))
+            if not rows:
+                break
+            results = model.transcribe(
+                audio=[str(Path(config.dataset_root) / Path(row["audio"])) for row in rows],
                 language=[LANGUAGE_NAMES[row["language"]] for row in rows],
             )
-            for row, result in zip(rows, outputs):
+            for row, result in zip(rows, results):
                 hypothesis = result.text.strip()
                 if not hypothesis:
-                    rejected.append(
-                        {"id": row["id"], "reason": "empty_greedy_output"}
-                    )
+                    rejected.write((json.dumps({"id": row["id"], "reason": "empty_greedy_output"}, ensure_ascii=False) + "\n").encode("utf-8"))
+                    state["rejected"] += 1
                     continue
                 generated = dict(row)
-                generated["text_reference"] = row["text"]
-                generated["text_mtp_target"] = hypothesis
-                generated["mtp_target_source"] = "qwen3_asr_greedy"
-                generated["mtp_target_model"] = config.model_path
-                generated["mtp_target_revision"] = config.model_revision
-                output_stream.write(
-                    json.dumps(generated, ensure_ascii=False) + "\n"
+                generated.update(
+                    text_reference=row["text"], text_mtp_target=hypothesis,
+                    mtp_target_token_count=len(tokenizer.encode(hypothesis, add_special_tokens=False)),
+                    mtp_target_source="qwen3_asr_greedy", mtp_target_model=config.model_path,
+                    mtp_target_revision=config.model_revision,
                 )
-            output_stream.flush()
-
-    completed = _load_completed(partial_path)
-    missing = [row["id"] for row in dataset.rows if row["id"] not in completed]
-    rejected_ids = {row["id"] for row in rejected}
-    unresolved = [sample_id for sample_id in missing if sample_id not in rejected_ids]
-    if unresolved:
-        raise RuntimeError(f"Generation incomplete, unresolved ids: {unresolved[:10]}")
-
-    stats = defaultdict(
-        lambda: {
-            "samples": 0,
-            "edits": 0,
-            "reference_units": 0,
-            "exact_token_matches": 0,
-            "prefix_ratio_sum": 0.0,
-        }
-    )
-    ordered_rows = []
-    for source_row in dataset.rows:
-        generated = completed.get(source_row["id"])
-        if generated is None:
-            continue
-        ordered_rows.append(generated)
-        _update_stats(
-            stats[
-                f"{source_row['language']}::"
-                f"{source_row.get('source', 'unknown')}"
-            ],
-            source_row,
-            generated["text_mtp_target"],
-            tokenizer,
-        )
-
-    temporary_final = final_path.with_suffix(".jsonl.tmp")
-    with temporary_final.open("w", encoding="utf-8", newline="\n") as stream:
-        for row in ordered_rows:
-            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
-    temporary_final.replace(final_path)
-    with rejected_path.open("w", encoding="utf-8", newline="\n") as stream:
-        for row in rejected:
-            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    report = {
-        "input_manifest": str(config.resolve_input_manifest()),
-        "output_manifest": str(final_path),
-        "input_samples": len(dataset),
-        "output_samples": len(ordered_rows),
-        "rejected_samples": len(rejected),
-        "by_language_source": {
-            key: _finalize_stats(value) for key, value in sorted(stats.items())
-        },
-    }
-    report_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    print(
-        f"complete output={final_path} samples={len(ordered_rows):,} "
-        f"rejected={len(rejected):,} report={report_path}",
-        flush=True,
-    )
+                output.write((json.dumps(generated, ensure_ascii=False) + "\n").encode("utf-8"))
+                state["written"] += 1
+            output.flush()
+            rejected.flush()
+            state["processed"] += len(rows)
+            state["audio_seconds"] += sum(float(row["duration_s"]) for row in rows)
+            state["batches"] += 1
+            state["input_offset"] = source.tell()
+            state["output_bytes"] = output.tell()
+            state["rejected_bytes"] = rejected.tell()
+            state["elapsed_seconds"] += time.perf_counter() - started
+            started = time.perf_counter()
+            _atomic_json(state_path, state)
+            if state["batches"] % config.log_every_batches == 0:
+                rate = state["processed"] / max(state["elapsed_seconds"], 1e-6)
+                audio_rate = state["audio_seconds"] / max(state["elapsed_seconds"], 1e-6)
+                byte_rate = state["input_offset"] / max(state["elapsed_seconds"], 1e-6)
+                eta_hours = (stat.st_size - state["input_offset"]) / max(byte_rate, 1e-6) / 3600
+                print(f"greedy batches={state['batches']:,} samples={state['processed']:,} speed={rate:.2f}/s audio={audio_rate:.2f}h/h eta={eta_hours:.2f}h", flush=True)
+    os.replace(partial_path, final_path)
+    state.update(complete=True, output_manifest=str(final_path))
+    _atomic_json(state_path, state)
+    print(f"complete output={final_path} samples={state['written']:,} rejected={state['rejected']:,}", flush=True)
 
 
 if __name__ == "__main__":
