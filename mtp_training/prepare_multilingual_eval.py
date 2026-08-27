@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -51,24 +52,27 @@ def _sample_id(row: dict) -> str:
     )
 
 
-def _audio_fingerprint(row: dict) -> tuple[str, str]:
+def _audio_fingerprint(row: dict) -> tuple[str, str] | None:
     pcm_hash = row.get("sha256_pcm")
     if pcm_hash:
         return "pcm", str(pcm_hash)
     file_hash = row.get("sha256_file")
     if file_hash:
         return "file", str(file_hash)
-    raise ValueError(
-        f"Manifest sample {_sample_id(row)} has neither sha256_pcm nor sha256_file"
-    )
+    return None
 
 
 def _fingerprints(row: dict) -> list[tuple[str, str]]:
-    result = [("id", _sample_id(row)), _audio_fingerprint(row)]
+    result = [("id", _sample_id(row))]
+    audio_fingerprint = _audio_fingerprint(row)
+    if audio_fingerprint is not None:
+        result.append(audio_fingerprint)
     source = row.get("source")
     source_id = row.get("source_id")
     if source and source_id:
         result.append(("source_id", f"{source}:{source_id}"))
+    elif source and row.get("audio"):
+        result.append(("source_audio", f"{source}:{row['audio']}"))
     for name in ("speaker_id", "origin_recording_id"):
         value = row.get(name)
         if value:
@@ -109,7 +113,13 @@ def main() -> None:
                     overlap = eval_fingerprints.get((kind, value))
                     if overlap and (
                         overlap[0] != split
-                        or kind in ("id", "pcm", "file", "source_id")
+                        or kind in (
+                            "id",
+                            "pcm",
+                            "file",
+                            "source_id",
+                            "source_audio",
+                        )
                     ):
                         raise RuntimeError(
                             f"{split} sample {_sample_id(row)} overlaps {overlap[0]} "
@@ -131,12 +141,14 @@ def main() -> None:
         reports[split] = dict(sorted(counts.items()))
 
     scanned = 0
+    missing_audio_hashes = 0
     with train_manifest.open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, start=1):
             if not line.strip():
                 continue
             row = json.loads(line)
             scanned += 1
+            missing_audio_hashes += int(_audio_fingerprint(row) is None)
             for fingerprint in _fingerprints(row):
                 overlap = eval_fingerprints.get(fingerprint)
                 if overlap:
@@ -147,14 +159,23 @@ def main() -> None:
                     )
             if scanned % 100_000 == 0:
                 print(f"leakage scan train rows={scanned:,}", flush=True)
-    print(f"leakage scan complete train rows={scanned:,}", flush=True)
+    print(
+        f"leakage scan complete train rows={scanned:,} "
+        f"rows_without_audio_hash={missing_audio_hashes:,}",
+        flush=True,
+    )
 
     for split, (rows, output_name) in candidates.items():
         selected_rows = []
         for row in rows:
             source_audio = source_root / Path(row["audio"])
             suffix = source_audio.suffix.lower()
-            _, audio_fingerprint = _audio_fingerprint(row)
+            fingerprint = _audio_fingerprint(row)
+            audio_fingerprint = (
+                fingerprint[1]
+                if fingerprint is not None
+                else hashlib.sha256(_sample_id(row).encode("utf-8")).hexdigest()
+            )
             relative = (
                 Path("audio_eval")
                 / split
