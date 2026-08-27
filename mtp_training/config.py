@@ -51,6 +51,9 @@ class TrainConfig:
     reference_eval_steps: int = 0
     verify_every_epochs: float = 0.0
     greedy_target_model_revision: str = ""
+    tensorboard_enabled: bool = False
+    tensorboard_log_dir: str = ""
+    tensorboard_flush_secs: int = 30
     train_target_text_field: str = "text"
     eval_target_text_field: str = "text"
 
@@ -92,6 +95,8 @@ class TrainConfig:
             raise ValueError("reference_eval_max_new_tokens must be >= 1")
         if config.reference_eval_steps < 0:
             raise ValueError("reference_eval_steps must be >= 0")
+        if config.tensorboard_flush_secs < 1:
+            raise ValueError("tensorboard_flush_secs must be >= 1")
         if config.num_train_epochs < 0:
             raise ValueError("num_train_epochs must be >= 0")
         if config.initial_step < 0:

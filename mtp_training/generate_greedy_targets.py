@@ -12,6 +12,7 @@ from typing import Any
 import torch
 import yaml
 from qwen_asr import Qwen3ASRModel
+from tqdm.auto import tqdm
 
 from .data import LANGUAGE_NAMES
 
@@ -55,6 +56,26 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _configure_padding(model, tokenizer) -> None:
+    eos_token_id = tokenizer.eos_token_id
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = eos_token_id
+    candidates = [
+        model,
+        getattr(model, "model", None),
+        getattr(getattr(model, "model", None), "thinker", None),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        generation_config = getattr(candidate, "generation_config", None)
+        if generation_config is not None:
+            generation_config.pad_token_id = eos_token_id
+        model_config = getattr(candidate, "config", None)
+        if model_config is not None:
+            model_config.pad_token_id = eos_token_id
 
 
 def main() -> None:
@@ -112,55 +133,73 @@ def main() -> None:
         max_new_tokens=config.max_new_tokens,
     )
     tokenizer = model.processor.tokenizer
+    _configure_padding(model, tokenizer)
     started = time.perf_counter()
-    with input_path.open("rb") as source, partial_path.open("ab") as output, rejected_path.open("ab") as rejected:
-        source.seek(state["input_offset"])
-        while True:
-            rows = []
-            for _ in range(config.batch_size):
-                line = source.readline()
-                if not line:
+    progress = tqdm(
+        total=stat.st_size,
+        initial=state["input_offset"],
+        desc=f"greedy {config.output_name}",
+        unit="B",
+        unit_scale=True,
+        dynamic_ncols=True,
+    )
+    try:
+        with input_path.open("rb") as source, partial_path.open("ab") as output, rejected_path.open("ab") as rejected:
+            source.seek(state["input_offset"])
+            while True:
+                previous_offset = source.tell()
+                rows = []
+                for _ in range(config.batch_size):
+                    line = source.readline()
+                    if not line:
+                        break
+                    if line.strip():
+                        rows.append(json.loads(line))
+                if not rows:
                     break
-                if line.strip():
-                    rows.append(json.loads(line))
-            if not rows:
-                break
-            results = model.transcribe(
-                audio=[str(Path(config.dataset_root) / Path(row["audio"])) for row in rows],
-                language=[LANGUAGE_NAMES[row["language"]] for row in rows],
-            )
-            for row, result in zip(rows, results):
-                hypothesis = result.text.strip()
-                if not hypothesis:
-                    rejected.write((json.dumps({"id": row["id"], "reason": "empty_greedy_output"}, ensure_ascii=False) + "\n").encode("utf-8"))
-                    state["rejected"] += 1
-                    continue
-                generated = dict(row)
-                generated.update(
-                    text_reference=row["text"], text_mtp_target=hypothesis,
-                    mtp_target_token_count=len(tokenizer.encode(hypothesis, add_special_tokens=False)),
-                    mtp_target_source="qwen3_asr_greedy", mtp_target_model=config.model_path,
-                    mtp_target_revision=config.model_revision,
+                results = model.transcribe(
+                    audio=[str(Path(config.dataset_root) / Path(row["audio"])) for row in rows],
+                    language=[LANGUAGE_NAMES[row["language"]] for row in rows],
                 )
-                output.write((json.dumps(generated, ensure_ascii=False) + "\n").encode("utf-8"))
-                state["written"] += 1
-            output.flush()
-            rejected.flush()
-            state["processed"] += len(rows)
-            state["audio_seconds"] += sum(float(row["duration_s"]) for row in rows)
-            state["batches"] += 1
-            state["input_offset"] = source.tell()
-            state["output_bytes"] = output.tell()
-            state["rejected_bytes"] = rejected.tell()
-            state["elapsed_seconds"] += time.perf_counter() - started
-            started = time.perf_counter()
-            _atomic_json(state_path, state)
-            if state["batches"] % config.log_every_batches == 0:
-                rate = state["processed"] / max(state["elapsed_seconds"], 1e-6)
-                audio_rate = state["audio_seconds"] / max(state["elapsed_seconds"], 1e-6)
-                byte_rate = state["input_offset"] / max(state["elapsed_seconds"], 1e-6)
-                eta_hours = (stat.st_size - state["input_offset"]) / max(byte_rate, 1e-6) / 3600
-                print(f"greedy batches={state['batches']:,} samples={state['processed']:,} speed={rate:.2f}/s audio={audio_rate:.2f}h/h eta={eta_hours:.2f}h", flush=True)
+                for row, result in zip(rows, results):
+                    hypothesis = result.text.strip()
+                    if not hypothesis:
+                        rejected.write((json.dumps({"id": row["id"], "reason": "empty_greedy_output"}, ensure_ascii=False) + "\n").encode("utf-8"))
+                        state["rejected"] += 1
+                        continue
+                    generated = dict(row)
+                    generated.update(
+                        text_reference=row["text"], text_mtp_target=hypothesis,
+                        mtp_target_token_count=len(tokenizer.encode(hypothesis, add_special_tokens=False)),
+                        mtp_target_source="qwen3_asr_greedy", mtp_target_model=config.model_path,
+                        mtp_target_revision=config.model_revision,
+                    )
+                    output.write((json.dumps(generated, ensure_ascii=False) + "\n").encode("utf-8"))
+                    state["written"] += 1
+                output.flush()
+                rejected.flush()
+                state["processed"] += len(rows)
+                state["audio_seconds"] += sum(float(row["duration_s"]) for row in rows)
+                state["batches"] += 1
+                state["input_offset"] = source.tell()
+                state["output_bytes"] = output.tell()
+                state["rejected_bytes"] = rejected.tell()
+                state["elapsed_seconds"] += time.perf_counter() - started
+                started = time.perf_counter()
+                _atomic_json(state_path, state)
+                progress.update(source.tell() - previous_offset)
+                if state["batches"] % max(config.log_every_batches // 20, 1) == 0:
+                    rate = state["processed"] / max(state["elapsed_seconds"], 1e-6)
+                    audio_rate = state["audio_seconds"] / max(state["elapsed_seconds"], 1e-6)
+                    progress.set_postfix(
+                        samples=f"{state['processed']:,}",
+                        speed=f"{rate:.2f}/s",
+                        audio=f"{audio_rate:.2f}h/h",
+                        rejected=f"{state['rejected']:,}",
+                        refresh=True,
+                    )
+    finally:
+        progress.close()
     os.replace(partial_path, final_path)
     state.update(complete=True, output_manifest=str(final_path))
     _atomic_json(state_path, state)

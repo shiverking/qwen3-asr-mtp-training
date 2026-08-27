@@ -119,6 +119,55 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def create_tensorboard_writer(config: TrainConfig, global_step: int):
+    if not config.tensorboard_enabled:
+        return None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError as error:
+        raise RuntimeError(
+            "TensorBoard is enabled but not installed; run: pip install tensorboard"
+        ) from error
+    log_dir = config.tensorboard_log_dir or str(Path(config.output_dir) / "tensorboard")
+    return SummaryWriter(
+        log_dir=log_dir,
+        purge_step=global_step + 1 if global_step else None,
+        flush_secs=config.tensorboard_flush_secs,
+    )
+
+
+def write_tensorboard_eval(writer, metrics: dict, step: int) -> None:
+    if writer is None:
+        return
+    macro = metrics["macro_average"]
+    writer.add_scalar("eval/loss", macro["loss"], step)
+    writer.add_scalar(
+        "eval/greedy_accepted_length",
+        macro["strict_average_accepted_length"],
+        step,
+    )
+    for position, value in enumerate(macro["strict_position_acceptance"], start=1):
+        writer.add_scalar(f"eval/position_acceptance/p{position}", value, step)
+    for language, values in metrics.items():
+        if language in ("all", "macro_average"):
+            continue
+        writer.add_scalar(
+            f"eval_language/{language}/greedy_accepted_length",
+            values["strict_average_accepted_length"],
+            step,
+        )
+
+
+def write_tensorboard_verify(writer, metrics: dict, step: int) -> None:
+    if writer is None:
+        return
+    writer.add_scalar("verify/accepted_length", metrics["average_accepted_length"], step)
+    for position, value in enumerate(metrics["strict_position_acceptance"], start=1):
+        writer.add_scalar(f"verify/position_acceptance/p{position}", value, step)
+    for language, value in metrics["by_language"].items():
+        writer.add_scalar(f"verify_language/{language}/accepted_length", value, step)
+
+
 def validate_dataset_gate(config: TrainConfig) -> None:
     root = Path(config.dataset_root)
     temporary_files = list((root / "manifests").rglob("*.tmp"))
@@ -378,6 +427,7 @@ def main() -> None:
         expected_hash = checkpoint_metadata.get("train_manifest_sha256")
         if expected_hash and expected_hash != runtime_metadata["train_manifest_sha256"]:
             raise RuntimeError("Training manifest hash differs from checkpoint")
+    tensorboard_writer = create_tensorboard_writer(config, global_step)
 
     optimizer.zero_grad(set_to_none=True)
     model.train()
@@ -439,6 +489,20 @@ def main() -> None:
                 "max_memory_gib": torch.cuda.max_memory_allocated() / 2**30,
             }
             append_metric(metrics_path, {"event": "train", **payload})
+            if tensorboard_writer is not None:
+                tensorboard_writer.add_scalar("train/loss", payload["loss"], global_step)
+                tensorboard_writer.add_scalar(
+                    "train/learning_rate", payload["learning_rate"], global_step
+                )
+                tensorboard_writer.add_scalar(
+                    "train/steps_per_second", payload["steps_per_second"], global_step
+                )
+                tensorboard_writer.add_scalar(
+                    "train/max_memory_gib", payload["max_memory_gib"], global_step
+                )
+                tensorboard_writer.add_scalar(
+                    "train/epoch", global_step / optimizer_steps_per_epoch, global_step
+                )
             progress.set_postfix(
                 loss=f"{payload['loss']:.4f}",
                 lr=f"{payload['learning_rate']:.2e}",
@@ -463,6 +527,9 @@ def main() -> None:
                 "reference_eval": None,
             }
             append_metric(metrics_path, eval_payload)
+            write_tensorboard_eval(tensorboard_writer, metrics, global_step)
+            if tensorboard_writer is not None:
+                tensorboard_writer.flush()
             progress.write(concise_eval(current_epoch, global_step, metrics))
 
         if config.reference_eval_samples and verify_interval and run_step % verify_interval == 0:
@@ -497,6 +564,11 @@ def main() -> None:
                     },
                 },
             )
+            write_tensorboard_verify(
+                tensorboard_writer, reference_metrics, global_step
+            )
+            if tensorboard_writer is not None:
+                tensorboard_writer.flush()
             progress.write(concise_verify(current_epoch, reference_metrics))
 
         if run_step % save_interval == 0:
@@ -506,6 +578,8 @@ def main() -> None:
                 runtime_metadata=runtime_metadata,
             )
             prune_checkpoints(output_dir, config.save_total_limit)
+            if tensorboard_writer is not None:
+                tensorboard_writer.flush()
             progress.write(f"saved {checkpoint}")
 
     progress.close()
@@ -516,6 +590,8 @@ def main() -> None:
             output_dir, global_step, model, optimizer, scheduler, config,
             runtime_metadata=runtime_metadata,
         )
+    if tensorboard_writer is not None:
+        tensorboard_writer.close()
 
 
 if __name__ == "__main__":

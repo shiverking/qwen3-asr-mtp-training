@@ -37,6 +37,9 @@ dependencies = [
 vllm = [
   "vllm==0.14.0",
 ]
+mtp-training = [
+  "tensorboard>=2.15",
+]
 
 [project.urls]
 Homepage = "https://github.com/Qwen/Qwen3-ASR"
