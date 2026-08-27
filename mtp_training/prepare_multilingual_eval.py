@@ -35,8 +35,41 @@ class EvalDataConfig:
         return cls(**values)
 
 
+def _sample_id(row: dict) -> str:
+    sample_id = row.get("id")
+    if sample_id:
+        return str(sample_id)
+    source = row.get("source")
+    source_id = row.get("source_id")
+    if source and source_id:
+        return f"{source}:{source_id}"
+    audio = row.get("audio")
+    if audio:
+        return f"audio:{audio}"
+    raise ValueError(
+        "Manifest row has no usable id, source/source_id, or audio path: "
+        f"keys={sorted(row)}"
+    )
+
+
+def _audio_fingerprint(row: dict) -> tuple[str, str]:
+    pcm_hash = row.get("sha256_pcm")
+    if pcm_hash:
+        return "pcm", str(pcm_hash)
+    file_hash = row.get("sha256_file")
+    if file_hash:
+        return "file", str(file_hash)
+    raise ValueError(
+        f"Manifest sample {_sample_id(row)} has neither sha256_pcm nor sha256_file"
+    )
+
+
 def _fingerprints(row: dict) -> list[tuple[str, str]]:
-    result = [("id", str(row["id"])), ("pcm", str(row["sha256_pcm"]))]
+    result = [("id", _sample_id(row)), _audio_fingerprint(row)]
+    source = row.get("source")
+    source_id = row.get("source_id")
+    if source and source_id:
+        result.append(("source_id", f"{source}:{source_id}"))
     for name in ("speaker_id", "origin_recording_id"):
         value = row.get(name)
         if value:
@@ -68,7 +101,10 @@ def main() -> None:
             row = json.loads(line)
             connection.executemany(
                 "INSERT OR IGNORE INTO fingerprints VALUES (?, ?, 'train', ?)",
-                [(kind, value, row["id"]) for kind, value in _fingerprints(row)],
+                [
+                    (kind, value, _sample_id(row))
+                    for kind, value in _fingerprints(row)
+                ],
             )
     connection.commit()
     reports = {}
@@ -90,14 +126,24 @@ def main() -> None:
                         "SELECT split, sample_id FROM fingerprints WHERE kind=? AND value=?",
                         (kind, value),
                     ).fetchone()
-                    if overlap and (overlap[0] != split or kind in ("id", "pcm")):
+                    if overlap and (
+                        overlap[0] != split
+                        or kind in ("id", "pcm", "file", "source_id")
+                    ):
                         raise RuntimeError(
-                            f"{split} sample {row['id']} overlaps {overlap[0]} "
+                            f"{split} sample {_sample_id(row)} overlaps {overlap[0]} "
                             f"sample {overlap[1]} by {kind}"
                         )
                 source_audio = source_root / Path(row["audio"])
                 suffix = source_audio.suffix.lower()
-                relative = Path("audio_eval") / split / row["language"] / row["sha256_pcm"][:2] / f"{row['sha256_pcm']}{suffix}"
+                _, audio_fingerprint = _audio_fingerprint(row)
+                relative = (
+                    Path("audio_eval")
+                    / split
+                    / row["language"]
+                    / audio_fingerprint[:2]
+                    / f"{audio_fingerprint}{suffix}"
+                )
                 destination = target_root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if not destination.exists():
@@ -112,7 +158,10 @@ def main() -> None:
                 counts[row["language"]] += 1
                 connection.executemany(
                     "INSERT OR IGNORE INTO fingerprints VALUES (?, ?, ?, ?)",
-                    [(kind, value, split, row["id"]) for kind, value in _fingerprints(row)],
+                    [
+                        (kind, value, split, _sample_id(row))
+                        for kind, value in _fingerprints(row)
+                    ],
                 )
         missing = {language: counts[language] for language in LANGUAGES if counts[language] < config.minimum_per_language}
         if missing:
