@@ -18,7 +18,7 @@ class TrainConfig:
     alpha: float = 0.9
     seed: int = 20260819
     max_steps: int = 2000
-    num_train_epochs: int = 0
+    num_train_epochs: float = 0.0
     initial_step: int = 0
     batch_size: int = 8
     gradient_accumulation_steps: int = 4

@@ -36,3 +36,17 @@ def test_rejects_unknown_loss_reduction(tmp_path: Path):
     config.write_text("loss_reduction: batch_mean\n", encoding="utf-8")
     with pytest.raises(ValueError, match="loss_reduction"):
         TrainConfig.from_yaml(config)
+
+
+def test_accepts_fractional_train_epochs(tmp_path: Path):
+    config = tmp_path / "stage2.yaml"
+    config.write_text(
+        "stage: 2\n"
+        "num_train_epochs: 0.25\n"
+        "init_mtp_from: /tmp/checkpoint\n",
+        encoding="utf-8",
+    )
+
+    loaded = TrainConfig.from_yaml(config)
+
+    assert loaded.num_train_epochs == 0.25
