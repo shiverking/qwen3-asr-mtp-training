@@ -14,6 +14,7 @@ from safetensors.torch import load_file, save_file
 
 MTP_FORMAT_VERSION = 1
 MTP_ARCHITECTURE = "paraasr_serial"
+SUPPORTED_TRAINING_CHECKPOINT_FORMATS = {1, 2}
 REQUIRED_CHECKPOINT_FILES = (
     "trainable_model.safetensors",
     "trainer_state.pt",
@@ -38,7 +39,7 @@ def _validate_complete_checkpoint(checkpoint: Path) -> dict[str, Any]:
     if missing:
         raise ValueError(f"Checkpoint is incomplete; missing files: {missing}")
     config = _load_json(checkpoint / "mtp_config.json")
-    if config.get("format_version") != 1:
+    if config.get("format_version") not in SUPPORTED_TRAINING_CHECKPOINT_FORMATS:
         raise ValueError(f"Unsupported training checkpoint format: {config.get('format_version')!r}")
     if int(config.get("stage", 0)) not in (1, 2):
         raise ValueError("Checkpoint stage must be 1 or 2")
@@ -135,7 +136,10 @@ def _overlay_backbone_weights(
 
 
 def export_checkpoint(
-    base_model: str | Path, checkpoint: str | Path, output_dir: str | Path
+    base_model: str | Path,
+    checkpoint: str | Path,
+    output_dir: str | Path,
+    stage1_checkpoint: str | Path | None = None,
 ) -> Path:
     base_model = Path(base_model).resolve()
     checkpoint = Path(checkpoint).resolve()
@@ -152,6 +156,27 @@ def export_checkpoint(
     depth = int(train_config["mtp_depth"])
     trainable = load_file(checkpoint / "trainable_model.safetensors", device="cpu")
     mtp_weights, backbone_weights = _convert_trainable_weights(trainable, stage, depth)
+
+    stage1_checkpoint_path: Path | None = None
+    if stage1_checkpoint is not None:
+        stage1_checkpoint_path = Path(stage1_checkpoint).resolve()
+        stage1_config = _validate_complete_checkpoint(stage1_checkpoint_path)
+        if int(stage1_config["stage"]) != 1 or stage != 2:
+            raise ValueError("Combined export requires a Stage 1 checkpoint and a Stage 2 checkpoint")
+        if int(stage1_config["mtp_depth"]) != depth:
+            raise ValueError("Stage 1 and Stage 2 checkpoints use different MTP depths")
+        stage1_position_mode = stage1_config.get("branch_position_mode", "base")
+        stage2_position_mode = train_config.get("branch_position_mode", "base")
+        if stage1_position_mode != stage2_position_mode:
+            raise ValueError("Stage 1 and Stage 2 checkpoints use different branch position modes")
+        stage1_trainable = load_file(
+            stage1_checkpoint_path / "trainable_model.safetensors", device="cpu"
+        )
+        stage1_mtp_weights, _ = _convert_trainable_weights(
+            stage1_trainable, stage=1, depth=depth
+        )
+        stage1_mtp_weights.update(mtp_weights)
+        mtp_weights = stage1_mtp_weights
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent))
@@ -207,6 +232,9 @@ def export_checkpoint(
             "base_model": str(base_model),
             "base_model_revision": model_config.get("_commit_hash"),
             "training_checkpoint": str(checkpoint),
+            "stage1_training_checkpoint": (
+                str(stage1_checkpoint_path) if stage1_checkpoint_path is not None else None
+            ),
             "training_stage": stage,
             "global_step": int(train_config.get("global_step", 0)),
             "mtp_depth": depth,
@@ -227,10 +255,25 @@ def export_checkpoint(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export a Qwen3-ASR ParaASR-style MTP checkpoint")
     parser.add_argument("--base-model", required=True, help="Local Qwen3-ASR model directory")
-    parser.add_argument("--checkpoint", required=True, help="Completed training checkpoint directory")
+    parser.add_argument(
+        "--checkpoint",
+        "--stage2-checkpoint",
+        dest="checkpoint",
+        required=True,
+        help="Completed Stage 2 training checkpoint directory",
+    )
+    parser.add_argument(
+        "--stage1-checkpoint",
+        help="Optional Stage 1 checkpoint applied before the Stage 2 checkpoint",
+    )
     parser.add_argument("--output-dir", required=True, help="New self-contained model directory")
     args = parser.parse_args()
-    exported = export_checkpoint(args.base_model, args.checkpoint, args.output_dir)
+    exported = export_checkpoint(
+        args.base_model,
+        args.checkpoint,
+        args.output_dir,
+        stage1_checkpoint=args.stage1_checkpoint,
+    )
     print(exported)
 
 

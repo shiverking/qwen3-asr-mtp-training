@@ -26,7 +26,9 @@ def _write_base_model(path: Path) -> None:
     (path / "processor_config.json").write_text("{}", encoding="utf-8")
 
 
-def _write_checkpoint(path: Path, *, stage: int = 1, depth: int = 2) -> None:
+def _write_checkpoint(
+    path: Path, *, stage: int = 1, depth: int = 2, format_version: int = 1
+) -> None:
     path.mkdir()
     weights = {}
     for layer in range(depth):
@@ -38,7 +40,12 @@ def _write_checkpoint(path: Path, *, stage: int = 1, depth: int = 2) -> None:
     (path / "trainer_state.pt").write_bytes(b"complete")
     (path / "mtp_config.json").write_text(
         json.dumps(
-            {"format_version": 1, "stage": stage, "mtp_depth": depth, "global_step": 10}
+            {
+                "format_version": format_version,
+                "stage": stage,
+                "mtp_depth": depth,
+                "global_step": 10,
+            }
         ),
         encoding="utf-8",
     )
@@ -76,6 +83,23 @@ def test_export_stage2_overlays_backbone_weight(tmp_path: Path):
 
     exported = load_file(output / "model.safetensors", device="cpu")
     assert torch.equal(exported["thinker.model.norm.weight"], torch.ones(2) * 7)
+
+
+def test_export_combines_v2_stage1_and_stage2(tmp_path: Path):
+    base = tmp_path / "base"
+    stage1 = tmp_path / "stage1"
+    stage2 = tmp_path / "stage2"
+    output = tmp_path / "export"
+    _write_base_model(base)
+    _write_checkpoint(stage1, stage=1, format_version=2)
+    _write_checkpoint(stage2, stage=2, format_version=2)
+
+    export_checkpoint(base, stage2, output, stage1_checkpoint=stage1)
+
+    metadata = json.loads((output / "mtp_export_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["stage1_training_checkpoint"] == str(stage1.resolve())
+    assert metadata["training_checkpoint"] == str(stage2.resolve())
+    assert (output / "mtp_model.safetensors").is_file()
 
 
 def test_export_rejects_incomplete_checkpoint(tmp_path: Path):
