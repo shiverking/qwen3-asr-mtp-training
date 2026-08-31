@@ -20,7 +20,16 @@ def _write_base_model(path: Path) -> None:
         path / "model.safetensors",
     )
     (path / "config.json").write_text(
-        json.dumps({"architectures": ["Qwen3ASRForConditionalGeneration"]}),
+        json.dumps(
+            {
+                "architectures": ["Qwen3ASRForConditionalGeneration"],
+                "model_type": "qwen3_asr",
+                "thinker_config": {
+                    "audio_config": {"model_type": "qwen3_asr_audio_encoder"},
+                    "text_config": {"model_type": "qwen3"},
+                },
+            }
+        ),
         encoding="utf-8",
     )
     (path / "processor_config.json").write_text("{}", encoding="utf-8")
@@ -70,6 +79,26 @@ def test_export_stage1_creates_self_contained_index(tmp_path: Path):
     assert metadata["training_stage"] == 1
     assert metadata["branch_position_mode"] == "base"
     assert metadata["files"]["mtp_model.safetensors"]
+
+
+def test_export_rejects_base_model_without_thinker_config(tmp_path: Path):
+    base = tmp_path / "base"
+    checkpoint = tmp_path / "checkpoint"
+    output = tmp_path / "export"
+    _write_base_model(base)
+    (base / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3ASRForConditionalGeneration"],
+                "model_type": "qwen3_asr",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_checkpoint(checkpoint)
+
+    with pytest.raises(ValueError, match="thinker_config"):
+        export_checkpoint(base, checkpoint, output)
 
 
 def test_export_stage2_overlays_backbone_weight(tmp_path: Path):

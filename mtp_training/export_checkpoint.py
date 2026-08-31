@@ -34,6 +34,22 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _validate_base_model_config(model_config: dict[str, Any]) -> None:
+    if model_config.get("model_type") != "qwen3_asr":
+        raise ValueError("Base model config.json must have model_type='qwen3_asr'")
+    architectures = model_config.get("architectures")
+    if not isinstance(architectures, list) or "Qwen3ASRForConditionalGeneration" not in architectures:
+        raise ValueError(
+            "Base model config.json must declare Qwen3ASRForConditionalGeneration"
+        )
+    thinker_config = model_config.get("thinker_config")
+    if not isinstance(thinker_config, dict):
+        raise ValueError("Base model config.json is missing thinker_config")
+    for name in ("audio_config", "text_config"):
+        if not isinstance(thinker_config.get(name), dict):
+            raise ValueError(f"Base model thinker_config is missing {name}")
+
+
 def _validate_complete_checkpoint(checkpoint: Path) -> dict[str, Any]:
     missing = [name for name in REQUIRED_CHECKPOINT_FILES if not (checkpoint / name).is_file()]
     if missing:
@@ -146,6 +162,7 @@ def export_checkpoint(
     output_dir = Path(output_dir).resolve()
     if not base_model.is_dir():
         raise ValueError("base_model must be a local self-contained model directory")
+    _validate_base_model_config(_load_json(base_model / "config.json"))
     if output_dir.is_relative_to(base_model):
         raise ValueError("output_dir must not be inside base_model")
     if output_dir.exists():
@@ -207,6 +224,7 @@ def export_checkpoint(
 
         config_path = temporary / "config.json"
         model_config = _load_json(config_path)
+        _validate_base_model_config(model_config)
         model_config.update(
             {
                 "mtp_format_version": MTP_FORMAT_VERSION,
